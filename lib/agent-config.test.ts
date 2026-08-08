@@ -133,6 +133,80 @@ describe("buildDesiredEntry", () => {
   });
 });
 
+describe("buildDesiredEntry with coalescing", () => {
+  const wrapped = buildDesiredEntry({
+    id: "kimi",
+    displayName: "Kimi Code",
+    command: "kimi",
+    coalesce: true,
+  });
+
+  it("registers /bin/sh with the launch snippet and the real CLI in env", () => {
+    expect(wrapped.command).toBe("/bin/sh");
+    expect(wrapped.args).toHaveLength(4);
+    expect(wrapped.args?.[0]).toBe("-c");
+    expect(wrapped.args?.[1]).toContain("acp-coalesce.mjs");
+    // $0 for the sh script, then the positional args the agent receives.
+    expect(wrapped.args?.slice(2)).toEqual(["kimi-acp", "acp"]);
+    expect(wrapped.env).toEqual({ KIMI_ACP_REAL: "kimi" });
+  });
+
+  it("threads a custom CLI path through env, not through the snippet", () => {
+    const custom = buildDesiredEntry({
+      id: "kimi",
+      displayName: "Kimi Code",
+      command: "/opt/tools dir/kimi",
+      coalesce: true,
+    });
+    // The snippet is a CONSTANT — a path with spaces or shell metacharacters
+    // can never corrupt it because it only ever travels as data.
+    expect(custom.args?.[1]).toBe(wrapped.args?.[1]);
+    expect(custom.env).toEqual({ KIMI_ACP_REAL: "/opt/tools dir/kimi" });
+  });
+
+  it("keeps identity fields identical across plain and wrapped shapes", () => {
+    const plainWithLogo = buildDesiredEntry({
+      id: "kimi",
+      displayName: "Kimi Code",
+      command: "kimi",
+      logo: "/data/kimi-code.svg",
+    });
+    const wrappedWithLogo = buildDesiredEntry({
+      id: "kimi",
+      displayName: "Kimi Code",
+      command: "kimi",
+      logo: "/data/kimi-code.svg",
+      coalesce: true,
+    });
+    expect(wrappedWithLogo.id).toBe(plainWithLogo.id);
+    expect(wrappedWithLogo.displayName).toBe(plainWithLogo.displayName);
+    expect(wrappedWithLogo.logo).toBe(plainWithLogo.logo);
+  });
+
+  it("marks the plain→wrapped transition as a change, and re-syncs as none", () => {
+    const registeredPlain = upsertAgent({}, entry).config;
+    const enable = upsertAgent(registeredPlain, wrapped);
+    expect(enable.changed).toBe(true);
+
+    // The same wrapped entry again: byte-stable, so sync stays idempotent and
+    // never churns config.json or triggers a config reload.
+    const resync = upsertAgent(enable.config, {
+      ...buildDesiredEntry({
+        id: "kimi",
+        displayName: "Kimi Code",
+        command: "kimi",
+        coalesce: true,
+      }),
+    });
+    expect(resync.changed).toBe(false);
+
+    // And the user can toggle back to exactly the original plain shape.
+    const disable = upsertAgent(enable.config, entry);
+    expect(disable.changed).toBe(true);
+    expect(findAgent(disable.config, "kimi")).toEqual(entry);
+  });
+});
+
 describe("findAgent", () => {
   it("finds by id", () => {
     expect(findAgent({ customAcpAgents: [entry] }, "kimi")).toEqual(entry);

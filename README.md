@@ -1,13 +1,22 @@
 # bb-plugin-kimi
 
-Makes **Kimi Code** (Moonshot AI) a provider in [bb](https://github.com/ymichael/bb),
+Makes **Kimi Code** (Moonshot AI) a provider in [bb](https://github.com/get-bb/bb),
 alongside Codex and Claude Code. Threads run on `acp-kimi`, with Kimi's models in
 bb's normal model picker.
 
+## Install
+
+You need [Kimi Code](https://moonshotai.github.io/kimi-code/) on your PATH and a
+`kimi login` you have completed at least once.
+
 ```sh
-bb plugin install .
+bb plugin install git:https://github.com/vburojevic/bb-plugin-kimi.git@main
+bb kimi status                 # confirm registration + per-machine health
 bb thread spawn --provider acp-kimi --model kimi-code/k3 --prompt "..."
 ```
+
+Not signed in yet? `bb kimi login` opens a terminal running the device-code
+flow. If anything looks wrong, `bb kimi doctor` prints the raw ACP handshake.
 
 ## How it works
 
@@ -34,6 +43,9 @@ The entry it writes is deliberately minimal:
   "logo": "<dataDir>/plugins/kimi/kimi-code.svg"
 }
 ```
+
+(With progress coalescing on — the default — `command`/`args` instead point at a
+small proxy. See [Tool-call progress coalescing](#tool-call-progress-coalescing).)
 
 No `modelCli`, `reasoningCli`, `nativeReasoning`, or `permissionCli` — because
 bb's ACP bridge already handles all four natively for Kimi:
@@ -183,9 +195,53 @@ bb kimi unregister             # remove acp-kimi from bb's config
 | `cliPath` | `""` | Absolute path to `kimi`. Empty uses the bare `kimi` on each host's PATH. |
 | `displayName` | `Kimi Code` | Provider name shown in bb. |
 | `manageProvider` | `true` | Turn off to stop the plugin touching `config.json`. |
+| `coalesceProgress` | `true` | Route the agent through the progress coalescer (below). |
 | `showLogo` | `true` | Use the bundled Kimi glyph as the provider logo. |
 
 Settings changes re-register immediately; no reload needed.
+
+## Tool-call progress coalescing
+
+bb persists **every** ACP `session/update` notification as a row in its event
+store. Kimi streams a `tool_call_update` snapshot for each terminal-output tick,
+so one long-running command can write tens of thousands of ~4KB rows. In the
+session that motivated this, two threads grew `bb.db` to 576MB and pinned the bb
+server's main thread in synchronous SQLite scans — the whole app stuttered.
+
+The agent cannot be told to stream less, and the bridge is bb core, so the one
+seam a plugin owns is the spawned process. With `coalesceProgress` on, the
+registered command becomes:
+
+```jsonc
+{
+  "command": "/bin/sh",
+  "args": ["-c", "<launch snippet>", "kimi-acp", "acp"],
+  "env": { "KIMI_ACP_REAL": "kimi" }
+}
+```
+
+The snippet runs `$HOME/.bb/plugins/kimi/acp-coalesce.mjs` when that file and
+`node` are present, and otherwise `exec`s the plain CLI — so a machine the
+plugin has not reached yet degrades to stock behaviour instead of breaking. The
+plugin materializes that proxy on every connected machine and refreshes it on a
+sweep, so late-joining hosts are covered.
+
+**It is lossless.** ACP `tool_call_update` fields *replace* prior values rather
+than appending, so merging a run of updates per `(sessionId, toolCallId)` —
+newest field wins — and emitting the merged snapshot is semantically identical
+to delivering every tick. Terminal statuses flush immediately, and any
+non-coalescable message flushes held state first, so ordering bb can observe is
+preserved. A representative 60-chunk command now writes **17 events / 3KB** with
+zero progress rows.
+
+Tuning, mostly for debugging:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `KIMI_COALESCE_MS` | `500` | Max snapshot rate per tool call. `0` disables coalescing. |
+| `KIMI_MAX_LINE_BYTES` | `33554432` | Lines above this stream through verbatim instead of being buffered. |
+
+Turn the whole thing off with `bb plugin config kimi set coalesceProgress false`.
 
 ## Safety notes
 
@@ -203,10 +259,29 @@ thread would break it. Use `bb kimi unregister`.
 
 ```sh
 npm install
-npx tsc --noEmit
-npx vitest run
+npm run typecheck
+npm test          # 135 tests
 bb plugin dev .
 ```
+
+The suite spawns real processes rather than mocking them: the coalescer tests
+run the actual materialized proxy against scripted fake agents (coalescing,
+ordering, UTF-8 across chunk boundaries, backpressure, oversized lines, signal
+handling), `lib/launch-snippet.test.ts` drives the real `/bin/sh` fallback
+chain, and `lib/shell-quote.test.ts` round-trips hostile paths through a shell.
+`server.test.ts` runs the plugin factory against a fake bb host.
+
+A note if you touch `lib/wrapper.ts`: the proxy is embedded as the
+`WRAPPER_SOURCE` template literal, so escaping is load-bearing — a backtick or
+`${` inside it terminates the literal, and `\n` must be written `\\n`. Verify
+changes against the emitted file, not just the literal.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+"Kimi" and the Kimi mark are trademarks of Moonshot AI. This is an unofficial,
+community-maintained plugin and is not affiliated with or endorsed by Moonshot AI.
 
 ## Branding
 

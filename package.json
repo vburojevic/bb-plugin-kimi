@@ -1,7 +1,31 @@
 {
   "name": "bb-plugin-kimi",
   "version": "0.1.0",
+  "description": "Adds Moonshot AI's Kimi Code as a BB provider (acp-kimi) over the Agent Client Protocol.",
+  "license": "MIT",
+  "author": "Vedran Burojevi\u0107",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vburojevic/bb-plugin-kimi.git"
+  },
+  "homepage": "https://github.com/vburojevic/bb-plugin-kimi#readme",
+  "bugs": {
+    "url": "https://github.com/vburojevic/bb-plugin-kimi/issues"
+  },
+  "keywords": [
+    "bb",
+    "bb-plugin",
+    "kimi",
+    "kimi-code",
+    "moonshot",
+    "acp",
+    "agent-client-protocol"
+  ],
   "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
   "engines": {
     "bb": ">=0.35",
     "bbPluginSdk": "^0.4.1"
@@ -19,8 +43,6 @@
     ]
   },
   "dependencies": {
-    "@hugeicons/core-free-icons": "^4.1.3",
-    "@hugeicons/react": "^1.1.6",
     "@radix-ui/react-slot": "^1.3.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
@@ -32,12 +54,10 @@
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
-    "better-sqlite3": "^12.0.0",
     "hono": "^4.11.9",
     "sonner": "^2.0.7",
     "typescript": "^5.7.0",
     "vaul": "^1.1.2",
-    "vitest": "^3.2.7",
-    "zod": "^4.3.6"
+    "vitest": "^3.2.7"
   }
 }

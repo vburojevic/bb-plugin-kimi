@@ -49,6 +49,9 @@ interface JsonRpcMessage {
 // false failure there.
 const DEFAULT_TIMEOUT_MS = 45_000;
 
+/** Ceiling on unterminated stdout held for line reassembly (see the reader). */
+const MAX_BUFFER_CHARS = 1_000_000;
+
 function failure(
   code: NonNullable<AcpProbeResult["code"]>,
   error: string,
@@ -74,6 +77,8 @@ export async function probeAcpAgent(args: {
   command: string;
   args: string[];
   cwd: string;
+  /** Extra variables layered over the server's env — the registered entry's `env`. */
+  env?: Record<string, string>;
   timeoutMs?: number;
 }): Promise<AcpProbeResult> {
   const timeoutMs = args.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -83,7 +88,12 @@ export async function probeAcpAgent(args: {
     child = spawn(args.command, args.args, {
       cwd: args.cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
+      env: { ...process.env, ...args.env },
+      // Own process group, so termination can target the whole tree. The
+      // probe no longer spawns the CLI directly — it spawns `/bin/sh -c` which
+      // execs the coalescer, which spawns the CLI. Signalling only the direct
+      // child would leave `kimi acp` orphaned under the BB server.
+      detached: true,
     });
   } catch (error) {
     return failure("missing_executable", error instanceof Error ? error.message : String(error));
@@ -97,6 +107,13 @@ export async function probeAcpAgent(args: {
 
   child.stdout?.on("data", (chunk: Buffer) => {
     buffer += chunk.toString("utf8");
+    // This runs INSIDE the BB server process, so an agent that floods stdout
+    // without ever emitting a newline must not be able to grow this buffer
+    // without bound. Protocol replies are small; anything past the cap is
+    // not a handshake response worth reassembling.
+    if (buffer.length > MAX_BUFFER_CHARS) {
+      buffer = buffer.slice(-MAX_BUFFER_CHARS);
+    }
     let newline: number;
     while ((newline = buffer.indexOf("\n")) >= 0) {
       const line = buffer.slice(0, newline).trim();
@@ -210,16 +227,31 @@ function terminate(child: ReturnType<typeof spawn>): void {
   } catch {
     // Already closed.
   }
-  child.kill("SIGTERM");
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  const escalation = setTimeout(() => {
-    if (child.exitCode === null && child.signalCode === null) {
+  // Signal the whole process group (the child is a group leader via
+  // `detached`). The chain is sh -> coalescer -> `kimi acp`, and SIGKILL can
+  // neither be caught nor forwarded by the middle process, so a pid-only kill
+  // would leave the CLI running under the BB server indefinitely.
+  const signalTree = (signal: NodeJS.Signals): void => {
+    const pid = child.pid;
+    if (pid !== undefined) {
       try {
-        child.kill("SIGKILL");
+        process.kill(-pid, signal);
+        return;
       } catch {
-        // Already gone.
+        // No group (already reaped, or the spawn never detached) — fall back.
       }
     }
+    try {
+      child.kill(signal);
+    } catch {
+      // Already gone.
+    }
+  };
+
+  signalTree("SIGTERM");
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const escalation = setTimeout(() => {
+    if (child.exitCode === null && child.signalCode === null) signalTree("SIGKILL");
   }, 3000);
   escalation.unref();
   child.once("exit", () => clearTimeout(escalation));

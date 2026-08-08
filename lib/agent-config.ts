@@ -8,6 +8,8 @@
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { LAUNCH_SNIPPET } from "./wrapper";
+
 export const CONFIG_FILE_NAME = "config.json";
 
 /** Matches BB's `customAcpAgentSchema` (strict — no extra keys survive validation). */
@@ -132,6 +134,8 @@ export interface DesiredEntryArgs {
   displayName: string;
   command: string;
   logo?: string | undefined;
+  /** Route the agent through the tool-call-progress coalescer (see wrapper.ts). */
+  coalesce?: boolean | undefined;
 }
 
 /**
@@ -143,13 +147,26 @@ export interface DesiredEntryArgs {
  * `thought_level` option, and BB's ACP bridge enforces permission modes itself
  * via `session/request_permission`. Declaring CLI-flag variants of any of these
  * would pass flags `kimi acp` does not accept.
+ *
+ * With `coalesce`, the command becomes `/bin/sh -c <LAUNCH_SNIPPET>` and the
+ * real CLI travels in `env.KIMI_ACP_REAL`: the snippet resolves per host at
+ * spawn time, running the coalescer where it has been materialized and exec'ing
+ * the plain CLI everywhere else, so the single shared entry never breaks a
+ * host the wrapper has not reached.
  */
 export function buildDesiredEntry(args: DesiredEntryArgs): CustomAcpAgentEntry {
-  return {
+  const identity = {
     id: args.id,
     displayName: args.displayName,
-    command: args.command,
-    args: ["acp"],
     ...(args.logo === undefined ? {} : { logo: args.logo }),
   };
+  if (args.coalesce === true) {
+    return {
+      ...identity,
+      command: "/bin/sh",
+      args: ["-c", LAUNCH_SNIPPET, "kimi-acp", "acp"],
+      env: { KIMI_ACP_REAL: args.command },
+    };
+  }
+  return { ...identity, command: args.command, args: ["acp"] };
 }

@@ -13,6 +13,9 @@
 // permission prompts — BB's own bridge consumes natively, so the entry stays
 // minimal and there is no model list to keep in sync here.
 
+import { homedir } from "node:os";
+import { dirname } from "node:path";
+
 import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
 
@@ -33,6 +36,12 @@ import {
   resolveHostErrorCode,
 } from "./lib/health";
 import { materializeLogo, pluginDataDir } from "./lib/logo";
+import { shellQuote } from "./lib/shell-quote";
+import {
+  WRAPPER_HOME_RELATIVE_PATH,
+  WRAPPER_SOURCE,
+  materializeWrapper,
+} from "./lib/wrapper";
 import {
   candidateSkillRoots,
   describeRoot,
@@ -80,6 +89,8 @@ const statusSchema = z.object({
   entry: z.record(z.string(), z.unknown()).nullable(),
   hosts: z.array(hostHealthSchema),
   warning: z.string().nullable(),
+  /** Whether tool-call progress coalescing is routed through the wrapper. */
+  coalescing: z.boolean(),
 });
 
 export const rpcContract = defineRpcContract({
@@ -119,6 +130,16 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Register the Kimi Code provider",
       default: true,
     },
+    coalesceProgress: {
+      type: "boolean",
+      label: "Coalesce tool-call progress updates",
+      description:
+        "Kimi streams a progress snapshot per output tick and BB persists each one; " +
+        "long sessions can write hundreds of megabytes of events and stall BB. " +
+        "This routes the agent through a small proxy that keeps at most ~2 " +
+        "snapshots per second per tool call, losslessly.",
+      default: true,
+    },
     showLogo: {
       type: "boolean",
       label: "Use the bundled Kimi logo",
@@ -133,10 +154,19 @@ export default async function plugin(bb: BbPluginApi) {
     return config.dataDir;
   }
 
+  /** The CLI itself — what `kimi login` runs and what the wrapper ultimately execs. */
+  async function resolveRealCommand(): Promise<string> {
+    const values = await settings.get();
+    const trimmedPath = values.cliPath.trim();
+    // A bare command resolves per host through the host daemon's PATH, which
+    // is what keeps one shared config.json valid across machines with
+    // different install locations. An absolute override is opt-in.
+    return trimmedPath.length > 0 ? trimmedPath : DEFAULT_COMMAND;
+  }
+
   async function resolveDesiredEntry(): Promise<CustomAcpAgentEntry> {
     const values = await settings.get();
     const dataDir = await resolveDataDir();
-    const trimmedPath = values.cliPath.trim();
     const displayName = values.displayName.trim() || "Kimi Code";
     const logo = values.showLogo
       ? materializeLogo(pluginDataDir(dataDir, bb.pluginId))
@@ -144,12 +174,132 @@ export default async function plugin(bb: BbPluginApi) {
     return buildDesiredEntry({
       id: AGENT_ID,
       displayName,
-      // A bare command resolves per host through the host daemon's PATH, which
-      // is what keeps one shared config.json valid across machines with
-      // different install locations. An absolute override is opt-in.
-      command: trimmedPath.length > 0 ? trimmedPath : DEFAULT_COMMAND,
+      command: await resolveRealCommand(),
       logo,
+      coalesce: values.coalesceProgress,
     });
+  }
+
+  // Distribution is triggered from several places (load, every sync, the
+  // service sweep, a settings change) and they overlap in practice. Two
+  // concurrent runs would stage to the same path and race on the rename, with
+  // the loser logging a spurious ENOENT. Single-flight collapses them: a
+  // caller arriving mid-run joins the run already in progress.
+  let distributionInFlight: Promise<void> | null = null;
+  function distributeWrapperOnce(): Promise<void> {
+    if (distributionInFlight !== null) return distributionInFlight;
+    const run = distributeWrapper().finally(() => {
+      if (distributionInFlight === run) distributionInFlight = null;
+    });
+    distributionInFlight = run;
+    return run;
+  }
+
+  /**
+   * Put the coalescer where the launch snippet looks for it —
+   * `$HOME/.bb/plugins/kimi/acp-coalesce.mjs` on every connected machine.
+   *
+   * Server-local via node:fs (the guaranteed baseline), remote hosts through
+   * `bb.sdk.files` best-effort with a deadline: a host that is slow or
+   * unreachable simply keeps running the plain CLI until the next sync, which
+   * the launch snippet makes safe by construction.
+   */
+  async function distributeWrapper(): Promise<void> {
+    try {
+      materializeWrapper(homedir());
+    } catch (error) {
+      bb.log.warn(
+        `could not materialize the coalescer locally: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    const withDeadline = <T,>(work: Promise<T>): Promise<T | null> =>
+      Promise.race([
+        work,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 15_000)),
+      ]);
+    const hosts = await bb.sdk.hosts.list();
+    for (const host of hosts) {
+      if (host.status !== "connected") continue;
+      try {
+        const resolved = await withDeadline(bb.sdk.hosts.directory({ hostId: host.id }));
+        const home = resolved?.directory;
+        if (home === undefined || home === null || home.length === 0) {
+          bb.log.warn(`coalescer not materialized on ${host.name}: home directory unresolved`);
+          continue;
+        }
+        const target = `${home}/${WRAPPER_HOME_RELATIVE_PATH}`;
+        // Skip a host that already has this exact content: distribution runs
+        // on every sync and on a timer, and the common case should cost one
+        // read rather than a write plus a rename.
+        const existing = await withDeadline(
+          bb.sdk.files
+            .read({ hostId: host.id, path: target, rootPath: home })
+            .catch(() => null),
+        );
+        if (existing !== null && existing?.content === WRAPPER_SOURCE) continue;
+
+        try {
+          // `recursive` defaults to false, and on a freshly enrolled host
+          // neither `.bb/plugins` nor `.bb/plugins/kimi` exists — without this
+          // the mkdir fails, the write then fails too, and the host silently
+          // runs the plain CLI forever while status claims coalescing is on.
+          await withDeadline(
+            bb.sdk.files.mkdir({
+              hostId: host.id,
+              path: dirname(target),
+              rootPath: home,
+              recursive: true,
+            }),
+          );
+        } catch {
+          // The write below reports the real failure, with the better message.
+        }
+        // Write to a temp sibling, then move into place. `bb` executes this
+        // file via the launch snippet's `-f` test, which cannot tell a
+        // half-written script from a complete one, so the file at the real
+        // path must only ever be complete.
+        const staging = `${target}.incoming`;
+        const written = await withDeadline(
+          bb.sdk.files.write({
+            hostId: host.id,
+            path: staging,
+            // Confinement guard: even a corrupted home value can only ever
+            // land this write inside that home, never elsewhere on the host.
+            rootPath: home,
+            content: WRAPPER_SOURCE,
+            createParents: true,
+            mode: 0o644,
+          }),
+        );
+        if (written === null) {
+          bb.log.warn(`coalescer not materialized on ${host.name}: timed out`);
+          continue;
+        }
+        // `move` refuses to replace an existing destination, so clear the old
+        // copy first. The window between the two is covered by the snippet's
+        // plain-CLI fallback.
+        try {
+          await withDeadline(
+            bb.sdk.files.remove({ hostId: host.id, path: target, rootPath: home }),
+          );
+        } catch {
+          // Nothing to replace on a first install.
+        }
+        await withDeadline(
+          bb.sdk.files.move({
+            hostId: host.id,
+            sourcePath: staging,
+            destinationPath: target,
+            rootPath: home,
+          }),
+        );
+        bb.log.info(`coalescer materialized on ${host.name}`);
+      } catch (error) {
+        bb.log.warn(
+          `coalescer not materialized on ${host.name}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
   }
 
   /**
@@ -162,6 +312,16 @@ export default async function plugin(bb: BbPluginApi) {
     const values = await settings.get();
     if (!values.manageProvider) {
       return { changed: false, entry: null };
+    }
+    // Fire-and-forget on purpose: distribution is idempotent and the snippet
+    // degrades to the plain CLI wherever the file has not landed yet, so
+    // registration never waits on a slow host.
+    if (values.coalesceProgress) {
+      void distributeWrapperOnce().catch((error: unknown) => {
+        bb.log.warn(
+          `coalescer distribution failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
     }
     const dataDir = await resolveDataDir();
     const desired = await resolveDesiredEntry();
@@ -196,18 +356,44 @@ export default async function plugin(bb: BbPluginApi) {
   // re-measure.
   const HEALTH_CACHE_TTL_MS = 30_000;
   let healthCache: { at: number; results: HostHealth[] } | null = null;
+  // The TTL only helps callers arriving AFTER a read completes. The settings
+  // panel, `bb kimi status`, doctor and the service sweep overlap while the
+  // cache is cold, and each overlapping caller re-ran the whole fan-out —
+  // four concurrent reads issued eight `providers.models` calls, each able to
+  // spawn a full ACP handshake on a machine. Joining the run already in
+  // progress collapses them. This removes redundant work, not latency: the
+  // duplicates already ran concurrently.
+  let healthInFlight: Promise<HostHealth[]> | null = null;
+  // Bumped by every invalidation. Without it, a read that started BEFORE a
+  // corrective action would publish its now-stale answer when it lands,
+  // clobbering the fresh result `sync` just wrote and pinning the stale one
+  // for a whole TTL — breaking the "corrective actions always re-measure"
+  // contract above. An abandoned run still answers its own caller; it just
+  // never touches the cache.
+  let healthGeneration = 0;
 
   function invalidateHealth(): void {
     healthCache = null;
+    healthInFlight = null;
+    healthGeneration++;
   }
 
   async function readHostHealth(): Promise<HostHealth[]> {
     if (healthCache !== null && Date.now() - healthCache.at < HEALTH_CACHE_TTL_MS) {
       return healthCache.results;
     }
-    const results = await readHostHealthUncached();
-    healthCache = { at: Date.now(), results };
-    return results;
+    if (healthInFlight !== null) return healthInFlight;
+    const generation = healthGeneration;
+    const run = readHostHealthUncached()
+      .then((results) => {
+        if (generation === healthGeneration) healthCache = { at: Date.now(), results };
+        return results;
+      })
+      .finally(() => {
+        if (healthInFlight === run) healthInFlight = null;
+      });
+    healthInFlight = run;
+    return run;
   }
 
   /**
@@ -216,70 +402,76 @@ export default async function plugin(bb: BbPluginApi) {
    */
   async function readHostHealthUncached(): Promise<HostHealth[]> {
     const hosts = await bb.sdk.hosts.list();
-    const results: HostHealth[] = [];
-    for (const host of hosts) {
-      if (host.status !== "connected") {
-        results.push({
-          hostId: host.id,
-          hostName: host.name,
-          status: host.status,
-          available: false,
-          errorCode: "host_offline",
-          errorMessage: `Machine is ${host.status}.`,
-          models: [],
-          reasoningLevels: [],
-          offersReasoningChoice: false,
-        });
-        continue;
-      }
-      try {
-        const options = await bb.sdk.providers.models({
-          providerId: PROVIDER_ID,
-          hostId: host.id,
-        });
-        const models: ModelInfo[] = options.models.map((model) => ({
-          id: model.id,
-          displayName: model.displayName,
-          isDefault: model.isDefault,
-          reasoningEfforts: model.supportedReasoningEfforts.map((e) => e.reasoningEffort),
-        }));
-        const errorCode = resolveHostErrorCode({
-          models,
-          modelLoadError: options.modelLoadError?.code ?? null,
-        });
-        const reasoningLevels = collectReasoningLevels(models);
-        results.push({
-          hostId: host.id,
-          hostName: host.name,
-          status: host.status,
-          available: errorCode === null,
-          errorCode,
-          errorMessage: describeLoadError(errorCode),
-          models,
-          reasoningLevels,
-          offersReasoningChoice: offersReasoningChoice(reasoningLevels),
-        });
-      } catch (error) {
-        results.push({
-          hostId: host.id,
-          hostName: host.name,
-          status: host.status,
-          available: false,
-          errorCode: "failed",
-          errorMessage: error instanceof Error ? error.message : String(error),
-          models: [],
-          reasoningLevels: [],
-          offersReasoningChoice: false,
-        });
-      }
+    // One handshake per machine, so probing them concurrently adds no load to
+    // any single machine — the sequential loop only ever made the user wait
+    // for the SUM of every machine's handshake, which grows with the fleet.
+    // Promise.all preserves host order.
+    return Promise.all(hosts.map(readOneHostHealth));
+  }
+
+  async function readOneHostHealth(host: {
+    id: string;
+    name: string;
+    status: string;
+  }): Promise<HostHealth> {
+    if (host.status !== "connected") {
+      return {
+        hostId: host.id,
+        hostName: host.name,
+        status: host.status,
+        available: false,
+        errorCode: "host_offline",
+        errorMessage: `Machine is ${host.status}.`,
+        models: [],
+        reasoningLevels: [],
+        offersReasoningChoice: false,
+      };
     }
-    return results;
+    try {
+      const options = await bb.sdk.providers.models({
+        providerId: PROVIDER_ID,
+        hostId: host.id,
+      });
+      const models: ModelInfo[] = options.models.map((model) => ({
+        id: model.id,
+        displayName: model.displayName,
+        isDefault: model.isDefault,
+        reasoningEfforts: model.supportedReasoningEfforts.map((e) => e.reasoningEffort),
+      }));
+      const errorCode = resolveHostErrorCode({
+        models,
+        modelLoadError: options.modelLoadError?.code ?? null,
+      });
+      const reasoningLevels = collectReasoningLevels(models);
+      return {
+        hostId: host.id,
+        hostName: host.name,
+        status: host.status,
+        available: errorCode === null,
+        errorCode,
+        errorMessage: describeLoadError(errorCode),
+        models,
+        reasoningLevels,
+        offersReasoningChoice: offersReasoningChoice(reasoningLevels),
+      };
+    } catch (error) {
+      return {
+        hostId: host.id,
+        hostName: host.name,
+        status: host.status,
+        available: false,
+        errorCode: "failed",
+        errorMessage: error instanceof Error ? error.message : String(error),
+        models: [],
+        reasoningLevels: [],
+        offersReasoningChoice: false,
+      };
+    }
   }
 
   async function readStatus(): Promise<Status> {
     const values = await settings.get();
     const dataDir = await resolveDataDir();
-    const desired = await resolveDesiredEntry();
     const entry = findAgent(readConfigFile(dataDir), AGENT_ID) ?? null;
     const hosts = values.manageProvider ? await readHostHealth() : [];
 
@@ -296,12 +488,15 @@ export default async function plugin(bb: BbPluginApi) {
       managed: values.manageProvider,
       registered: entry !== null,
       providerId: PROVIDER_ID,
-      command: desired.command,
-      displayName: desired.displayName,
+      // The CLI, not the wrapper shell — this is what the app and `status`
+      // render as "command … acp", and what a user could run themselves.
+      command: await resolveRealCommand(),
+      displayName: values.displayName.trim() || "Kimi Code",
       configPath: `${dataDir}/config.json`,
       entry: entry as Record<string, unknown> | null,
       hosts,
       warning,
+      coalescing: values.manageProvider && values.coalesceProgress,
     };
   }
 
@@ -334,9 +529,10 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   async function resolveLoginCommand(): Promise<string> {
-    const desired = await resolveDesiredEntry();
-    // Quote only when needed so the terminal shows a command a user can retype.
-    return /\s/u.test(desired.command) ? JSON.stringify(desired.command) : desired.command;
+    // Always the real CLI: `login` is an interactive TTY flow, and routing it
+    // through the ACP coalescer would garble it. Shell-quoted because this is
+    // the one surface where the path becomes shell SOURCE, not argv data.
+    return shellQuote(await resolveRealCommand());
   }
 
   async function resolvePrimaryHostId(): Promise<string> {
@@ -586,10 +782,13 @@ export default async function plugin(bb: BbPluginApi) {
   async function runDoctor(): Promise<{ text: string; probe: unknown; status: Status }> {
     const status = await readStatus();
     const desired = await resolveDesiredEntry();
+    // Probing the DESIRED entry (wrapper and all) exercises exactly the chain
+    // BB spawns, so a coalescer problem shows up here and not just in threads.
     const probe = await probeAcpAgent({
       command: desired.command,
       args: desired.args ?? ["acp"],
       cwd: process.cwd(),
+      env: desired.env,
     });
 
     const lines: string[] = [formatStatus(status), "", "ACP handshake (BB server host only)"];
@@ -667,6 +866,22 @@ export default async function plugin(bb: BbPluginApi) {
 
       while (!signal.aborted) {
         try {
+          // Re-run distribution each cycle, not just at load. Machines are
+          // enrolled and reconnected at arbitrary times, and a host that was
+          // offline (or that carries a wrapper from an older plugin version)
+          // would otherwise run the plain CLI forever while status reports
+          // coalescing as on. The content check upstream makes the steady
+          // state one read per host per cycle.
+          const values = await settings.get();
+          if (values.manageProvider && values.coalesceProgress) {
+            await distributeWrapperOnce();
+          }
+        } catch (error) {
+          bb.log.warn(
+            `coalescer distribution sweep failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        try {
           const hosts = await readHostHealth();
           const reachable = hosts.filter((host) => host.status === "connected");
           if (reachable.length > 0 && reachable.every((host) => !host.available)) {
@@ -721,6 +936,7 @@ function formatStatus(status: Status): string {
     `  registered   ${status.registered ? "yes" : "no"}`,
     `  managed      ${status.managed ? "yes" : "no (settings)"}`,
     `  command      ${status.command} acp`,
+    `  coalescing   ${status.coalescing ? "on — tool-call progress is throttled via the wrapper" : "off"}`,
     `  display name ${status.displayName}`,
     `  config       ${status.configPath}`,
   ];
