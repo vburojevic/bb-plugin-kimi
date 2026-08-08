@@ -186,6 +186,10 @@ export default async function plugin(bb: BbPluginApi) {
   // the loser logging a spurious ENOENT. Single-flight collapses them: a
   // caller arriving mid-run joins the run already in progress.
   let distributionInFlight: Promise<void> | null = null;
+  // Hosts whose last materialization attempt failed: they are running the
+  // plain (un-coalesced) CLI right now, so the sweep retries them fast and
+  // status can call the regression out instead of silently claiming success.
+  const coalescerFailedHosts = new Set<string>();
   function distributeWrapperOnce(): Promise<void> {
     if (distributionInFlight !== null) return distributionInFlight;
     const run = distributeWrapper().finally(() => {
@@ -236,14 +240,20 @@ export default async function plugin(bb: BbPluginApi) {
             .read({ hostId: host.id, path: target, rootPath: home })
             .catch(() => null),
         );
-        if (existing !== null && existing?.content === WRAPPER_SOURCE) continue;
+        if (existing !== null && existing?.content === WRAPPER_SOURCE) {
+          coalescerFailedHosts.delete(host.id);
+          continue;
+        }
 
+        // `recursive` defaults to false, and on a freshly enrolled host
+        // neither `.bb/plugins` nor `.bb/plugins/kimi` exists — without this
+        // the mkdir fails, the write then fails too, and the host silently
+        // runs the plain CLI forever while status claims coalescing is on.
+        // A TIMED-OUT mkdir (null) is a failure too: proceeding to the write
+        // produced the observed "ENOENT …acp-coalesce.mjs.incoming".
+        let mkdirOk = false;
         try {
-          // `recursive` defaults to false, and on a freshly enrolled host
-          // neither `.bb/plugins` nor `.bb/plugins/kimi` exists — without this
-          // the mkdir fails, the write then fails too, and the host silently
-          // runs the plain CLI forever while status claims coalescing is on.
-          await withDeadline(
+          const made = await withDeadline(
             bb.sdk.files.mkdir({
               hostId: host.id,
               path: dirname(target),
@@ -251,14 +261,30 @@ export default async function plugin(bb: BbPluginApi) {
               recursive: true,
             }),
           );
-        } catch {
-          // The write below reports the real failure, with the better message.
+          mkdirOk = made !== null;
+        } catch (error) {
+          bb.log.warn(
+            `coalescer mkdir failed on ${host.name}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        if (!mkdirOk) {
+          coalescerFailedHosts.add(host.id);
+          bb.log.warn(
+            `coalescer not materialized on ${host.name}: directory create failed or timed out`,
+          );
+          continue;
         }
         // Write to a temp sibling, then move into place. `bb` executes this
         // file via the launch snippet's `-f` test, which cannot tell a
         // half-written script from a complete one, so the file at the real
         // path must only ever be complete.
-        const staging = `${target}.incoming`;
+        // Unique per attempt: a fixed `.incoming` name let two overlapping
+        // runs (reload while a sweep is mid-flight — single-flight only
+        // covers one plugin instance) race on the move, the loser hitting
+        // the same spurious ENOENT.
+        const staging = `${target}.incoming.${Date.now().toString(36)}${Math.random()
+          .toString(36)
+          .slice(2, 6)}`;
         const written = await withDeadline(
           bb.sdk.files.write({
             hostId: host.id,
@@ -285,16 +311,26 @@ export default async function plugin(bb: BbPluginApi) {
         } catch {
           // Nothing to replace on a first install.
         }
-        await withDeadline(
-          bb.sdk.files.move({
-            hostId: host.id,
-            sourcePath: staging,
-            destinationPath: target,
-            rootPath: home,
-          }),
-        );
+        try {
+          await withDeadline(
+            bb.sdk.files.move({
+              hostId: host.id,
+              sourcePath: staging,
+              destinationPath: target,
+              rootPath: home,
+            }),
+          );
+        } catch (error) {
+          // Best-effort cleanup so failed attempts don't strand staging files.
+          await bb.sdk.files
+            .remove({ hostId: host.id, path: staging, rootPath: home })
+            .catch(() => undefined);
+          throw error;
+        }
+        coalescerFailedHosts.delete(host.id);
         bb.log.info(`coalescer materialized on ${host.name}`);
       } catch (error) {
+        coalescerFailedHosts.add(host.id);
         bb.log.warn(
           `coalescer not materialized on ${host.name}: ${error instanceof Error ? error.message : String(error)}`,
         );
@@ -855,16 +891,31 @@ export default async function plugin(bb: BbPluginApi) {
   // CLI reports as needs-configuration instead of a load error.
   bb.background.service("provider-sync", {
     async start(signal) {
+      let reconciled = false;
       try {
         await reconcile();
+        reconciled = true;
       } catch (error) {
+        // Log-and-continue: throwing here killed the service permanently, so
+        // one transient hiccup at load (config read race, sdk not ready) left
+        // the provider unregistered and health monitoring dead until a manual
+        // sync or reload. The loop below retries — reconcile is idempotent.
         bb.log.error(
-          `provider registration failed: ${error instanceof Error ? error.message : String(error)}`,
+          `provider registration failed (will retry): ${error instanceof Error ? error.message : String(error)}`,
         );
-        throw error;
       }
 
       while (!signal.aborted) {
+        if (!reconciled) {
+          try {
+            await reconcile();
+            reconciled = true;
+          } catch (error) {
+            bb.log.warn(
+              `provider registration retry failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
         try {
           // Re-run distribution each cycle, not just at load. Machines are
           // enrolled and reconnected at arbitrary times, and a host that was
@@ -903,7 +954,13 @@ export default async function plugin(bb: BbPluginApi) {
             `health check failed: ${error instanceof Error ? error.message : String(error)}`,
           );
         }
-        await sleep(HEALTH_INTERVAL_MS, signal);
+        // A host whose coalescer failed to land is silently running the plain
+        // CLI firehose (the exact bb.db-bloat bug the coalescer exists to
+        // stop) — retry it on a tight cadence instead of in 15 minutes.
+        await sleep(
+          coalescerFailedHosts.size > 0 || !reconciled ? 60_000 : HEALTH_INTERVAL_MS,
+          signal,
+        );
       }
     },
   });
