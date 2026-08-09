@@ -14,6 +14,7 @@
 import {
   chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   rmSync,
   writeFileSync,
@@ -79,7 +80,13 @@ interface HealRun {
 
 interface HealRunOptions {
   env?: Record<string, string>;
-  stdinLines: string[];
+  stdinLines?: string[];
+  /**
+   * Raw stdin writes (strings or Buffers), sent sequentially with a small gap
+   * — for exercising the client-side parser across chunk boundaries. The
+   * caller controls newlines exactly.
+   */
+  stdinPieces?: (string | Buffer)[];
   /** Resolve once this many stdout lines have arrived (then the child is killed). */
   expectLines: number;
   /** Keep stdin open (so the wrapper stays alive) until expectLines arrive. */
@@ -139,7 +146,16 @@ function runHeal(agent: string, options: HealRunOptions): Promise<HealRun> {
       setTimeout(() => finish(code), 50);
     });
 
-    for (const line of options.stdinLines) child.stdin.write(`${line}\n`);
+    if (options.stdinPieces !== undefined) {
+      void (async () => {
+        for (const piece of options.stdinPieces!) {
+          child.stdin.write(piece);
+          await new Promise((resolve) => setTimeout(resolve, 30));
+        }
+      })();
+    } else {
+      for (const line of options.stdinLines ?? []) child.stdin.write(`${line}\n`);
+    }
   });
 }
 
@@ -368,6 +384,227 @@ describe("session/load healing", () => {
     expect(updates[0]).toContain("tick 1");
     const last = JSON.parse(run.lines[run.lines.length - 1]!);
     expect(last.id).toBe(10);
+  });
+
+  it("tracks a session/load request split across arbitrary stdin chunks", async () => {
+    const missing = join(fakeHome, "workspaces", "env_chunked");
+    const agent = writeRespondingAgent(`
+      if (message.method !== "session/load") return;
+      import("node:fs").then(({ existsSync }) => {
+        if (existsSync(${JSON.stringify(missing)})) {
+          emit({ jsonrpc: "2.0", id: message.id, result: ${JSON.stringify(LOAD_RESULT)} });
+        } else {
+          emit(${JSON.stringify(workspaceError("__ID__", missing)).replace('"__ID__"', "message.id")});
+        }
+      });
+    `);
+    const line = loadRequest(20);
+    const run = await runHeal(agent, {
+      stdinPieces: [line.slice(0, 15), line.slice(15, 40), `${line.slice(40)}\n`],
+      expectLines: 1,
+    });
+    const response = JSON.parse(run.lines[0]!);
+    expect(response.id).toBe(20);
+    expect(response.result).toEqual(LOAD_RESULT);
+    expect(existsSync(missing)).toBe(true);
+  });
+
+  it("survives multi-byte UTF-8 split across stdin chunk boundaries", async () => {
+    // The cwd carries a 4-byte emoji; the split lands mid-character. The
+    // parser must still recognize the request (and the forwarded bytes must
+    // reach the agent uncorrupted, proven by the echoed cwd in its error).
+    const missing = join(fakeHome, "workspaces", "env_🦊_utf8");
+    const agent = writeRespondingAgent(`
+      if (message.method !== "session/load") return;
+      import("node:fs").then(({ existsSync }) => {
+        if (existsSync(${JSON.stringify(missing)})) {
+          emit({ jsonrpc: "2.0", id: message.id, result: { echoedCwd: message.params.cwd } });
+        } else {
+          emit(${JSON.stringify(workspaceError("__ID__", missing)).replace('"__ID__"', "message.id")});
+        }
+      });
+    `);
+    const line = Buffer.from(`${loadRequest(21, "sess-utf8", missing)}\n`, "utf8");
+    const emojiByteIndex = line.indexOf(Buffer.from("🦊", "utf8")) + 2; // mid-emoji
+    const run = await runHeal(agent, {
+      stdinPieces: [line.subarray(0, emojiByteIndex), line.subarray(emojiByteIndex)],
+      expectLines: 1,
+    });
+    const response = JSON.parse(run.lines[0]!);
+    expect(response.id).toBe(21);
+    expect(response.result.echoedCwd).toBe(missing);
+    expect(existsSync(missing)).toBe(true);
+  });
+
+  it("does not confuse a string id with the same numeric id", async () => {
+    // BB sent id 30 (number); a response bearing id "30" (string) is NOT the
+    // answer to that request and must pass through untouched, unhealed.
+    const missing = join(fakeHome, "workspaces", "env_id_type");
+    const agent = writeRespondingAgent(`
+      if (message.method !== "session/load") return;
+      emit(${JSON.stringify(workspaceError("30", missing))});
+    `);
+    const run = await runHeal(agent, {
+      stdinLines: [loadRequest(30)],
+      expectLines: 1,
+    });
+    const response = JSON.parse(run.lines[0]!);
+    expect(response.id).toBe("30");
+    expect(response.error).toBeDefined();
+    expect(existsSync(missing)).toBe(false);
+    expect(run.stderr).not.toContain("recreated");
+  });
+
+  it("heals from the error.message variant when error.data is absent", async () => {
+    const missing = join(fakeHome, "workspaces", "env_message_variant");
+    const agent = writeRespondingAgent(`
+      if (message.method !== "session/load") return;
+      import("node:fs").then(({ existsSync }) => {
+        if (existsSync(${JSON.stringify(missing)})) {
+          emit({ jsonrpc: "2.0", id: message.id, result: ${JSON.stringify(LOAD_RESULT)} });
+        } else {
+          emit({ jsonrpc: "2.0", id: message.id, error: { code: -32603, message: "workspace root ${missing} does not exist" } });
+        }
+      });
+    `);
+    const run = await runHeal(agent, {
+      stdinLines: [loadRequest(31)],
+      expectLines: 1,
+    });
+    const response = JSON.parse(run.lines[0]!);
+    expect(response.id).toBe(31);
+    expect(response.result).toEqual(LOAD_RESULT);
+    expect(existsSync(missing)).toBe(true);
+  });
+
+  it("heals a path containing spaces and non-ASCII characters", async () => {
+    const missing = join(fakeHome, "work spaces", "envürö dir");
+    const agent = writeRespondingAgent(`
+      if (message.method !== "session/load") return;
+      import("node:fs").then(({ existsSync }) => {
+        if (existsSync(${JSON.stringify(missing)})) {
+          emit({ jsonrpc: "2.0", id: message.id, result: ${JSON.stringify(LOAD_RESULT)} });
+        } else {
+          emit(${JSON.stringify(workspaceError("__ID__", missing)).replace('"__ID__"', "message.id")});
+        }
+      });
+    `);
+    const run = await runHeal(agent, {
+      stdinLines: [loadRequest(32)],
+      expectLines: 1,
+    });
+    expect(JSON.parse(run.lines[0]!).result).toEqual(LOAD_RESULT);
+    expect(existsSync(missing)).toBe(true);
+  });
+
+  it("refuses to heal $HOME itself", async () => {
+    // The confinement requires a path STRICTLY inside home — "home/" prefix —
+    // so the home directory itself is never a mkdir target.
+    const agent = writeRespondingAgent(`
+      if (message.method !== "session/load") return;
+      emit(${JSON.stringify(workspaceError("__ID__", "__HOME__")).replace('"__ID__"', "message.id").replace("__HOME__", fakeHome)});
+    `);
+    const run = await runHeal(agent, {
+      stdinLines: [loadRequest(33)],
+      expectLines: 1,
+    });
+    const response = JSON.parse(run.lines[0]!);
+    expect(response.id).toBe(33);
+    expect(response.error).toBeDefined();
+    expect(run.stderr).not.toContain("recreated");
+  });
+
+  it("forwards the original error when a file blocks the mkdir", async () => {
+    // A FILE at the exact path mkdir would create makes the heal impossible.
+    const blocked = join(fakeHome, "workspaces", "env_blocked_by_file");
+    mkdirSync(join(fakeHome, "workspaces"), { recursive: true });
+    writeFileSync(blocked, "i am a file");
+    const agent = writeRespondingAgent(`
+      if (message.method !== "session/load") return;
+      emit(${JSON.stringify(workspaceError("__ID__", blocked)).replace('"__ID__"', "message.id")});
+    `);
+    const run = await runHeal(agent, {
+      stdinLines: [loadRequest(34)],
+      expectLines: 1,
+    });
+    const response = JSON.parse(run.lines[0]!);
+    expect(response.id).toBe(34);
+    expect(response.error.data.details).toContain("does not exist");
+  });
+
+  it("heals two concurrent loads independently, answering each original id", async () => {
+    const missingA = join(fakeHome, "workspaces", "env_conc_a");
+    const missingB = join(fakeHome, "workspaces", "env_conc_b");
+    const agent = writeRespondingAgent(`
+      if (message.method !== "session/load") return;
+      const target = message.params.sessionId === "sess-a"
+        ? ${JSON.stringify(missingA)}
+        : ${JSON.stringify(missingB)};
+      import("node:fs").then(({ existsSync }) => {
+        if (existsSync(target)) {
+          emit({ jsonrpc: "2.0", id: message.id, result: { loaded: message.params.sessionId } });
+        } else {
+          emit({ jsonrpc: "2.0", id: message.id, error: { code: -32603, message: "Internal error", data: { details: \`workspace root \${target} does not exist\` } } });
+        }
+      });
+    `);
+    const run = await runHeal(agent, {
+      stdinLines: [loadRequest(41, "sess-a"), loadRequest(42, "sess-b")],
+      expectLines: 2,
+    });
+    const responses = run.lines.map((line) => JSON.parse(line));
+    const byId = new Map(responses.map((response) => [response.id, response]));
+    expect(byId.get(41)?.result).toEqual({ loaded: "sess-a" });
+    expect(byId.get(42)?.result).toEqual({ loaded: "sess-b" });
+    expect(existsSync(missingA)).toBe(true);
+    expect(existsSync(missingB)).toBe(true);
+  });
+
+  it("evicts the oldest pending load beyond the cap, keeping recent ones healable", async () => {
+    const missing = join(fakeHome, "workspaces", "env_cap_recent");
+    const agent = writeRespondingAgent(`
+      if (message.method !== "session/load") return;
+      // Only ever answer the LAST request (id 139); everything else hangs.
+      if (message.id !== 139 && !String(message.id).startsWith("__kimi_coalesce_retry__")) return;
+      import("node:fs").then(({ existsSync }) => {
+        if (existsSync(${JSON.stringify(missing)})) {
+          emit({ jsonrpc: "2.0", id: message.id, result: ${JSON.stringify(LOAD_RESULT)} });
+        } else {
+          emit(${JSON.stringify(workspaceError("__ID__", missing)).replace('"__ID__"', "message.id")});
+        }
+      });
+    `);
+    // 40 pending loads (cap is 32): the earliest are evicted, the newest must
+    // still heal.
+    const run = await runHeal(agent, {
+      stdinLines: Array.from({ length: 40 }, (_, i) => loadRequest(100 + i)),
+      expectLines: 1,
+      timeoutMs: 15_000,
+    });
+    const response = JSON.parse(run.lines[0]!);
+    expect(response.id).toBe(139);
+    expect(response.result).toEqual(LOAD_RESULT);
+  });
+
+  it("forwards an evicted load's workspace error unhealed", async () => {
+    const missing = join(fakeHome, "workspaces", "env_cap_evicted");
+    const agent = writeRespondingAgent(`
+      if (message.method !== "session/load") return;
+      // Answer the FIRST request (id 200) only after ALL 40 have arrived, so
+      // the wrapper has provably evicted it before the error lands.
+      globalThis.loadCount = (globalThis.loadCount ?? 0) + 1;
+      if (globalThis.loadCount !== 40) return;
+      emit(${JSON.stringify(workspaceError(200, missing))});
+    `);
+    const run = await runHeal(agent, {
+      stdinLines: Array.from({ length: 40 }, (_, i) => loadRequest(200 + i)),
+      expectLines: 1,
+      timeoutMs: 15_000,
+    });
+    const response = JSON.parse(run.lines[0]!);
+    expect(response.id).toBe(200);
+    expect(response.error).toBeDefined();
+    expect(existsSync(missing)).toBe(false);
   });
 
   it("ignores oversized client lines without breaking later heals", async () => {

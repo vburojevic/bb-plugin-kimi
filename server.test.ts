@@ -686,3 +686,274 @@ describe("unregister", () => {
     expect(readConfig(host).customAcpAgents).toEqual([sibling]);
   });
 });
+
+describe("sessions command", () => {
+  const indexLine = (sessionId: string, workDir: string) =>
+    JSON.stringify({ sessionId, sessionDir: `/Users/h1/.kimi-code/sessions/${sessionId}`, workDir });
+
+  function sessionsSdk(options: {
+    index?: string | null;
+    existing?: string[];
+    homeDir?: string | null;
+  }) {
+    const pathsExistCalls: string[][] = [];
+    return {
+      pathsExistCalls,
+      sdk: {
+        "hosts.list": () => [{ id: "h1", name: "laptop", status: "connected" }],
+        "hosts.directory": () => {
+          if (options.homeDir === null) throw new Error("unresolved");
+          return { directory: options.homeDir ?? "/Users/h1" };
+        },
+        "files.read": () => {
+          if (options.index === null || options.index === undefined) {
+            throw new Error("ENOENT");
+          }
+          return { content: options.index };
+        },
+        "hosts.pathsExist": ({ paths }: { paths: string[] }) => {
+          pathsExistCalls.push(paths);
+          return {
+            existence: Object.fromEntries(
+              paths.map((path) => [path, (options.existing ?? []).includes(path)]),
+            ),
+          };
+        },
+        "providers.models": healthyModels,
+      },
+    };
+  }
+
+  it("reports restorable and broken workspace roots with session counts", async () => {
+    const fixture = sessionsSdk({
+      index: [
+        indexLine("s1", "/Users/h1/work/alive"),
+        indexLine("s2", "/Users/h1/work/alive"),
+        indexLine("s3", "/Users/h1/work/gone"),
+      ].join("\n"),
+      existing: ["/Users/h1/work/alive"],
+    });
+    const host = createFakeHost({ settings: { showLogo: false }, sdk: fixture.sdk });
+    await plugin(host.bb);
+
+    const result = await host.cliRun(["sessions"], {});
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("sessions      3");
+    expect(result.stdout).toContain("restorable    1 roots (2 sessions)");
+    expect(result.stdout).toContain("broken        1 roots (1 sessions)");
+    expect(result.stdout).toContain("/Users/h1/work/gone  (1 session)");
+    // The healing promise is stated where the user is looking at the damage.
+    expect(result.stdout).toMatch(/recreates the directory and retries/u);
+  });
+
+  it("batches existence checks: one pathsExist call with unique roots only", async () => {
+    const fixture = sessionsSdk({
+      index: [
+        indexLine("s1", "/Users/h1/work/a"),
+        indexLine("s2", "/Users/h1/work/a"),
+        indexLine("s3", "/Users/h1/work/b"),
+      ].join("\n"),
+      existing: [],
+    });
+    const host = createFakeHost({ settings: { showLogo: false }, sdk: fixture.sdk });
+    await plugin(host.bb);
+    await host.cliRun(["sessions"], {});
+    expect(fixture.pathsExistCalls).toEqual([["/Users/h1/work/a", "/Users/h1/work/b"]]);
+  });
+
+  it("emits machine-readable JSON with --json", async () => {
+    const fixture = sessionsSdk({
+      index: indexLine("s1", "/Users/h1/work/gone"),
+      existing: [],
+    });
+    const host = createFakeHost({ settings: { showLogo: false }, sdk: fixture.sdk });
+    await plugin(host.bb);
+
+    const result = await host.cliRun(["sessions", "--json"], {});
+    expect(result.exitCode).toBe(0);
+    const parsed = JSON.parse(result.stdout!);
+    expect(parsed.hostName).toBe("laptop");
+    expect(parsed.indexPath).toBe("/Users/h1/.kimi-code/session_index.jsonl");
+    expect(parsed.summary.broken).toEqual([
+      { workDir: "/Users/h1/work/gone", sessionIds: ["s1"] },
+    ]);
+    expect(parsed.summary.restorable).toEqual([]);
+  });
+
+  it("explains a machine with no session index instead of erroring", async () => {
+    const fixture = sessionsSdk({ index: null });
+    const host = createFakeHost({ settings: { showLogo: false }, sdk: fixture.sdk });
+    await plugin(host.bb);
+
+    const result = await host.cliRun(["sessions"], {});
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("No Kimi session index found");
+  });
+
+  it("fails cleanly when the machine's home directory cannot be resolved", async () => {
+    const fixture = sessionsSdk({ homeDir: null });
+    const host = createFakeHost({ settings: { showLogo: false }, sdk: fixture.sdk });
+    await plugin(host.bb);
+
+    const result = await host.cliRun(["sessions"], {});
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("home directory");
+  });
+
+  it("summarizes an empty index without inventing a broken section", async () => {
+    const fixture = sessionsSdk({ index: "\n  \nnot json {\n" });
+    const host = createFakeHost({ settings: { showLogo: false }, sdk: fixture.sdk });
+    await plugin(host.bb);
+
+    const result = await host.cliRun(["sessions"], {});
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("sessions      0");
+    expect(result.stdout).not.toContain("no longer exist");
+    // No roots means no existence fan-out at all.
+    expect(fixture.pathsExistCalls).toEqual([]);
+  });
+
+  it("resolves --machine by name", async () => {
+    const directories: string[] = [];
+    const fixture = sessionsSdk({ index: indexLine("s1", "/Users/h1/w"), existing: ["/Users/h1/w"] });
+    const host = createFakeHost({
+      settings: { showLogo: false },
+      sdk: {
+        ...fixture.sdk,
+        "hosts.list": () => [
+          { id: "h1", name: "laptop", status: "connected" },
+          { id: "h2", name: "mini", status: "connected" },
+        ],
+        "hosts.directory": ({ hostId }: { hostId: string }) => {
+          directories.push(hostId);
+          return { directory: "/Users/h1" };
+        },
+      },
+    });
+    await plugin(host.bb);
+
+    const result = await host.cliRun(["sessions", "--machine", "mini"], {});
+    expect(result.exitCode).toBe(0);
+    expect(directories).toEqual(["h2"]);
+    expect(result.stdout).toContain("Kimi sessions on mini");
+  });
+
+  it("rejects an unknown --machine", async () => {
+    const fixture = sessionsSdk({ index: null });
+    const host = createFakeHost({ settings: { showLogo: false }, sdk: fixture.sdk });
+    await plugin(host.bb);
+    const result = await host.cliRun(["sessions", "--machine", "nope"], {});
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('Unknown machine "nope"');
+  });
+});
+
+describe("transient health", () => {
+  it("classifies a daemon timeout as transient with a self-resolving message", async () => {
+    const host = createFakeHost({
+      settings: { showLogo: false },
+      sdk: {
+        "hosts.list": () => [{ id: "h1", name: "laptop", status: "connected" }],
+        "providers.models": () => {
+          throw new Error("Timed out waiting for command result");
+        },
+      },
+    });
+    await plugin(host.bb);
+
+    const status = await host.rpcHandlers.status!(null);
+    expect(status.hosts[0].available).toBe(false);
+    expect(status.hosts[0].errorCode).toBe("transient");
+    expect(status.hosts[0].errorMessage).toMatch(/retrying/iu);
+  });
+
+  it("keeps a hard failure's original message", async () => {
+    const host = createFakeHost({
+      settings: { showLogo: false },
+      sdk: {
+        "hosts.list": () => [{ id: "h1", name: "laptop", status: "connected" }],
+        "providers.models": () => {
+          throw new Error("spawn agent ENOENT");
+        },
+      },
+    });
+    await plugin(host.bb);
+
+    const status = await host.rpcHandlers.status!(null);
+    expect(status.hosts[0].errorCode).toBe("failed");
+    expect(status.hosts[0].errorMessage).toBe("spawn agent ENOENT");
+  });
+
+  async function runSweepOnce(host: FakeHost): Promise<void> {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const running = host.services["provider-sync"]!.start(controller.signal);
+      await vi.advanceTimersByTimeAsync(1_000);
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(100);
+      await running;
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  it("does not flap into needs-configuration when every failure is transient", async () => {
+    const host = createFakeHost({
+      settings: { showLogo: false, coalesceProgress: false },
+      sdk: {
+        "hosts.list": () => [
+          { id: "h1", name: "one", status: "connected" },
+          { id: "h2", name: "two", status: "connected" },
+        ],
+        "providers.models": () => {
+          throw new Error("Runtime shutting down");
+        },
+      },
+    });
+    await plugin(host.bb);
+    await runSweepOnce(host);
+    expect(host.logs.filter((log) => log.level === "needs-config")).toEqual([]);
+  });
+
+  it("still alerts when a hard failure sits behind a transient one", async () => {
+    const host = createFakeHost({
+      settings: { showLogo: false, coalesceProgress: false },
+      sdk: {
+        "hosts.list": () => [
+          { id: "h1", name: "one", status: "connected" },
+          { id: "h2", name: "two", status: "connected" },
+        ],
+        "providers.models": ({ hostId }: { hostId: string }) => {
+          if (hostId === "h1") throw new Error("Timed out waiting for command result");
+          return { models: [], modelLoadError: { code: "auth_required" } };
+        },
+      },
+    });
+    await plugin(host.bb);
+    await runSweepOnce(host);
+    const alerts = host.logs.filter((log) => log.level === "needs-config");
+    expect(alerts).toHaveLength(1);
+    // The alert speaks to the HARD failure (sign-in), not the timeout.
+    expect(alerts[0]!.message).toContain("bb kimi login");
+  });
+
+  it("stays quiet while any machine is healthy", async () => {
+    const host = createFakeHost({
+      settings: { showLogo: false, coalesceProgress: false },
+      sdk: {
+        "hosts.list": () => [
+          { id: "h1", name: "one", status: "connected" },
+          { id: "h2", name: "two", status: "connected" },
+        ],
+        "providers.models": ({ hostId }: { hostId: string }) => {
+          if (hostId === "h1") throw new Error("spawn agent ENOENT");
+          return healthyModels();
+        },
+      },
+    });
+    await plugin(host.bb);
+    await runSweepOnce(host);
+    expect(host.logs.filter((log) => log.level === "needs-config")).toEqual([]);
+  });
+});
