@@ -15,7 +15,21 @@ export type HostErrorCode =
   | "timeout"
   | "failed"
   | "unresolved_catalog"
-  | "host_offline";
+  | "host_offline"
+  | "transient";
+
+/**
+ * Whether a providers.models failure is a passing condition of the DAEMON
+ * (busy, restarting, disconnecting) rather than a statement about the Kimi
+ * install. These must not flip the plugin into needs-configuration: the
+ * observed failure mode was a `command_timeout` during a restart marking Kimi
+ * unavailable and alarming the user while threads were actually fine.
+ */
+export function isTransientProviderError(message: string): boolean {
+  return /timed out|shutting down|not connected|temporarily unavailable|disconnected/i.test(
+    message,
+  );
+}
 
 /**
  * Resolve a host's error code, or null when Kimi is genuinely healthy there.
@@ -92,6 +106,8 @@ export function describeLoadError(code: string | null): string | null {
       return "Kimi Code did not respond in time.";
     case "host_offline":
       return "Machine is not connected.";
+    case "transient":
+      return "Temporarily unreachable (daemon busy or restarting) — retrying.";
     case "unresolved_catalog":
       return (
         "BB could not read Kimi's model list — the CLI is missing, not signed in, " +

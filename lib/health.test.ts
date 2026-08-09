@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { ACP_DEFAULT_MODEL_ID, describeLoadError, resolveHostErrorCode } from "./health";
+import {
+  ACP_DEFAULT_MODEL_ID,
+  describeLoadError,
+  isTransientProviderError,
+  resolveHostErrorCode,
+} from "./health";
 
 const kimiModels = [
   { id: "kimi-code/k3" },
@@ -57,5 +62,30 @@ describe("describeLoadError", () => {
 
   it("falls back to a generic message for unknown codes", () => {
     expect(describeLoadError("something_new")).toMatch(/failed to report its models/u);
+  });
+
+  it("describes transient failures as self-resolving", () => {
+    expect(describeLoadError("transient")).toMatch(/retrying/iu);
+  });
+});
+
+describe("isTransientProviderError", () => {
+  // Each of these exact messages was observed in bb's server log while the
+  // daemon was busy or restarting; none says anything about the Kimi install.
+  it.each([
+    "Timed out waiting for command result",
+    "Runtime shutting down",
+    "HTTP 502: Host is not connected",
+    "Thread interrupted because the host daemon disconnected",
+  ])("classifies %j as transient", (message) => {
+    expect(isTransientProviderError(message)).toBe(true);
+  });
+
+  it.each([
+    "spawn agent ENOENT",
+    "Authentication required: 403",
+    "config.json is not valid JSON",
+  ])("keeps %j as a hard failure", (message) => {
+    expect(isTransientProviderError(message)).toBe(false);
   });
 });

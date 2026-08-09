@@ -1,5 +1,17 @@
 // The tool-call-progress coalescer that sits between BB and `kimi acp`.
 //
+// Since 0.2.0 the wrapper also owns session-load healing. Kimi's `session/load`
+// validates the WORKSPACE ROOT RECORDED WHEN THE SESSION WAS CREATED — not the
+// cwd BB passes on resume. BB routinely destroys and re-provisions worktree
+// environments, so resuming any thread whose original directory is gone fails
+// with "workspace root <path> does not exist"; BB's ACP bridge swallows that
+// error and silently continues in a FRESH session, i.e. the agent loses every
+// previous message. The wrapper sees both sides of the wire, so it can fix
+// this where it happens: it remembers in-flight `session/load` requests, and
+// when the agent answers one with that specific error it recreates the missing
+// directory (confined to $HOME) and retries the load once, transparently —
+// BB receives a single successful response under its original request id.
+//
 // Why it exists: BB's ACP bridge persists EVERY `session/update` notification
 // as a row in its event store. Kimi Code streams a `tool_call_update` snapshot
 // for each terminal-output tick, so one long command execution can write tens
@@ -56,11 +68,17 @@ export const LAUNCH_SNIPPET =
   'exec "${KIMI_ACP_REAL:-kimi}" "$@"';
 
 export const WRAPPER_SOURCE = `#!/usr/bin/env node
-// ACP stdio proxy: coalesces tool_call_update notifications from the agent
-// so BB persists snapshots at most every KIMI_COALESCE_MS (default 500ms) per
-// tool call, instead of one event per output tick. Managed by bb-plugin-kimi —
-// edits are overwritten on the next provider sync.
+// ACP stdio proxy for bb-plugin-kimi. Two jobs:
+//  1. Coalesce tool_call_update notifications so BB persists snapshots at most
+//     every KIMI_COALESCE_MS (default 500ms) per tool call, instead of one
+//     event per output tick.
+//  2. Heal session/load failures caused by a missing workspace root (BB
+//     destroys worktree environments; Kimi validates the session's original
+//     directory) by recreating the directory and retrying the load once —
+//     without this, resumed threads silently lose their entire history.
+// Managed by bb-plugin-kimi — edits are overwritten on the next provider sync.
 import { spawn } from "node:child_process";
+import { mkdirSync } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 
 const THROTTLE_MS = (() => {
@@ -73,6 +91,11 @@ const MAX_LINE_BYTES = (() => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 32 * 1024 * 1024;
 })();
 const REAL = process.env.KIMI_ACP_REAL ?? "kimi";
+// Session-load healing is on unless explicitly disabled.
+const HEAL = process.env.KIMI_SESSION_LOAD_HEAL !== "0";
+// Longest client line held for parsing; session/load requests are tiny, so
+// anything longer (a prompt with embedded context) is forwarded unexamined.
+const CLIENT_PARSE_MAX = 1024 * 1024;
 
 const child = spawn(REAL, process.argv.slice(2), {
   stdio: ["pipe", "pipe", "inherit"],
@@ -83,7 +106,165 @@ child.on("error", (error) => {
 });
 child.stdin.on("error", () => {});
 process.stdin.on("error", () => {});
-process.stdin.pipe(child.stdin);
+
+// --- session-load healing ----------------------------------------------------
+//
+// BB -> agent traffic is forwarded byte-for-byte, but a decoded copy is also
+// line-split so in-flight session/load requests can be remembered. When the
+// agent rejects one because the session's recorded workspace root no longer
+// exists, the wrapper recreates that directory (inside $HOME only), replays
+// the identical request under a wrapper-owned id, and forwards the retry's
+// response to BB under the original id. BB is dropping replayed notifications
+// while its load request is unresolved either way, so the extra replay the
+// retry produces is invisible to it.
+
+/** Ids can be numbers or strings; the key preserves the distinction. */
+function idKey(id) {
+  return typeof id + ":" + String(id);
+}
+
+// idKey(request id) -> the parsed session/load request (for the retry replay).
+const loadRequestsById = new Map();
+// idKey(retry id) -> { originalId, heldErrorLine } for in-flight retries.
+const retriesByAgentId = new Map();
+let retrySequence = 0;
+
+function rememberClientLine(line) {
+  if (!HEAL || line.length === 0) return;
+  let message = null;
+  try {
+    message = JSON.parse(line);
+  } catch {
+    return;
+  }
+  if (message === null || typeof message !== "object" || Array.isArray(message)) return;
+  if (message.method !== "session/load" || !("id" in message)) return;
+  loadRequestsById.set(idKey(message.id), message);
+  // Bounded: the bridge runs one load at a time, so anything beyond a handful
+  // of unanswered entries is a leak from a client that vanished mid-request.
+  if (loadRequestsById.size > 32) {
+    const oldest = loadRequestsById.keys().next().value;
+    loadRequestsById.delete(oldest);
+  }
+}
+
+/**
+ * The workspace-root path this error makes healable, or null.
+ * Confined to $HOME: the path is data from another process, so anything not
+ * strictly inside the home directory (or containing traversal segments) is
+ * refused and the original error passes through.
+ */
+function healableWorkspacePath(message) {
+  const error = message.error;
+  if (error === null || typeof error !== "object") return null;
+  const details =
+    typeof error.data?.details === "string"
+      ? error.data.details
+      : typeof error.message === "string"
+        ? error.message
+        : "";
+  const match = details.match(/workspace root (.+?) does not exist/);
+  if (match === null) return null;
+  const path = match[1];
+  const home = process.env.HOME ?? "";
+  if (home.length === 0 || !path.startsWith(home + "/")) return null;
+  if (path.includes("\\u0000") || path.split("/").includes("..")) return null;
+  return path;
+}
+
+/**
+ * Handle an agent->BB response that belongs to the healing flow. Returns true
+ * when the line was consumed (held or rewritten) and must not be forwarded.
+ */
+function interceptAgentResponse(message, line) {
+  if (!HEAL) return false;
+  if (message === null || typeof message !== "object" || Array.isArray(message)) return false;
+  if (!("id" in message) || typeof message.method === "string") return false;
+  const key = idKey(message.id);
+
+  const retry = retriesByAgentId.get(key);
+  if (retry !== undefined) {
+    // Whatever the retry produced — success or a different failure — BB gets
+    // exactly one response, under the id it is actually waiting on.
+    retriesByAgentId.delete(key);
+    message.id = retry.originalId;
+    flushAll();
+    writeOut(JSON.stringify(message) + "\\n");
+    return true;
+  }
+
+  const original = loadRequestsById.get(key);
+  if (original === undefined) return false;
+  loadRequestsById.delete(key);
+  const workspacePath = healableWorkspacePath(message);
+  if (workspacePath === null) return false;
+  try {
+    mkdirSync(workspacePath, { recursive: true });
+  } catch {
+    return false;
+  }
+  const retryId = \`__kimi_coalesce_retry__\${retrySequence++}\`;
+  retriesByAgentId.set(idKey(retryId), { originalId: message.id, heldErrorLine: line });
+  try {
+    child.stdin.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: retryId,
+        method: "session/load",
+        params: original.params,
+      }) + "\\n",
+    );
+  } catch {
+    retriesByAgentId.delete(idKey(retryId));
+    return false;
+  }
+  process.stderr.write(
+    \`acp-coalesce: recreated missing workspace root \${workspacePath}; retrying session/load\\n\`,
+  );
+  return true;
+}
+
+/** BB must never hang on a load whose retry the agent did not live to answer. */
+function releaseHeldLoadErrors() {
+  for (const retry of retriesByAgentId.values()) {
+    writeOut(retry.heldErrorLine + "\\n");
+  }
+  retriesByAgentId.clear();
+}
+
+const clientDecoder = new StringDecoder("utf8");
+let clientBuffer = "";
+let clientOverflowing = false;
+process.stdin.on("data", (chunk) => {
+  // Forward the original bytes first — parsing failures can never affect the
+  // wire. Backpressure mirrors what pipe() would do.
+  if (!child.stdin.write(chunk)) {
+    process.stdin.pause();
+    child.stdin.once("drain", () => process.stdin.resume());
+  }
+  let text = clientDecoder.write(chunk);
+  if (clientOverflowing) {
+    const newline = text.indexOf("\\n");
+    if (newline === -1) return;
+    clientOverflowing = false;
+    text = text.slice(newline + 1);
+  }
+  let start = 0;
+  let newline;
+  while ((newline = text.indexOf("\\n", start)) !== -1) {
+    rememberClientLine(clientBuffer + text.slice(start, newline));
+    clientBuffer = "";
+    start = newline + 1;
+  }
+  clientBuffer += text.slice(start);
+  if (clientBuffer.length > CLIENT_PARSE_MAX) {
+    clientBuffer = "";
+    clientOverflowing = true;
+  }
+});
+process.stdin.on("end", () => {
+  child.stdin.end();
+});
 
 // Backpressure: when BB's side of the pipe is full, pause the agent instead
 // of buffering its output without limit.
@@ -168,6 +349,7 @@ function handleLine(line) {
   } catch {
     message = null;
   }
+  if (interceptAgentResponse(message, line)) return;
   const key = message === null ? null : coalescableKey(message);
   if (key === null) {
     // Anything else — responses, requests, other session updates, unparsable
@@ -305,6 +487,7 @@ function finish(code, signal) {
   if (finishing) return;
   finishing = true;
   flushAll();
+  releaseHeldLoadErrors();
   // The stdin pipe would otherwise keep this process alive after the agent
   // is gone.
   process.stdin.destroy();

@@ -32,9 +32,15 @@ import { findModelOption, findThinkingOption, probeAcpAgent } from "./lib/acp-pr
 import {
   collectReasoningLevels,
   describeLoadError,
+  isTransientProviderError,
   offersReasoningChoice,
   resolveHostErrorCode,
 } from "./lib/health";
+import {
+  groupByWorkDir,
+  parseSessionIndex,
+  summarizeRestorability,
+} from "./lib/sessions";
 import { materializeLogo, pluginDataDir } from "./lib/logo";
 import { shellQuote } from "./lib/shell-quote";
 import {
@@ -491,13 +497,18 @@ export default async function plugin(bb: BbPluginApi) {
         offersReasoningChoice: offersReasoningChoice(reasoningLevels),
       };
     } catch (error) {
+      const messageText = error instanceof Error ? error.message : String(error);
+      // A daemon that is busy or mid-restart says nothing about the Kimi
+      // install; classifying it separately keeps the sweep from flapping
+      // into needs-configuration on every restart.
+      const transient = isTransientProviderError(messageText);
       return {
         hostId: host.id,
         hostName: host.name,
         status: host.status,
         available: false,
-        errorCode: "failed",
-        errorMessage: error instanceof Error ? error.message : String(error),
+        errorCode: transient ? "transient" : "failed",
+        errorMessage: transient ? describeLoadError("transient") : messageText,
         models: [],
         reasoningLevels: [],
         offersReasoningChoice: false,
@@ -591,6 +602,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "sync", summary: "Re-register the provider from current settings", usage: "bb kimi sync" },
       { name: "login", summary: "Open a terminal running the Kimi device-code login", usage: "bb kimi login [--machine <id-or-name>]" },
       { name: "skills", summary: "Skill roots Kimi discovers on a machine", usage: "bb kimi skills [--machine <id-or-name>] [--json]" },
+      { name: "sessions", summary: "Which Kimi sessions on a machine can still restore their history", usage: "bb kimi sessions [--machine <id-or-name>] [--json]" },
       { name: "doctor", summary: "Probe the Kimi ACP handshake on the BB server host", usage: "bb kimi doctor [--json]" },
       { name: "unregister", summary: "Remove the provider from BB's config", usage: "bb kimi unregister" },
     ],
@@ -708,6 +720,46 @@ export default async function plugin(bb: BbPluginApi) {
             );
             return ok(lines.join("\n"));
           }
+          case "sessions": {
+            const hostId = await resolveMachineArg(flagValue("machine"), ctx.threadId);
+            const hosts = await bb.sdk.hosts.list();
+            const hostName = hosts.find((h) => h.id === hostId)?.name ?? hostId;
+            const report = await readSessionRestorability(hostId);
+            if (wantsJson) return ok(JSON.stringify({ hostName, ...report }, null, 2));
+            if (report.home === null) {
+              return fail(`Could not resolve the home directory on ${hostName}.`);
+            }
+            if (report.summary === null) {
+              return ok(
+                `No Kimi session index found on ${hostName} — Kimi has not recorded any sessions there yet.`,
+              );
+            }
+            const { summary } = report;
+            const lines = [
+              `Kimi sessions on ${hostName}`,
+              "",
+              `  sessions      ${summary.totalSessions}`,
+              `  directories   ${summary.totalWorkDirs} recorded workspace roots`,
+              `  restorable    ${summary.restorable.length} roots (${summary.restorable.reduce((n, g) => n + g.sessionIds.length, 0)} sessions)`,
+              `  broken        ${summary.broken.length} roots (${summary.broken.reduce((n, g) => n + g.sessionIds.length, 0)} sessions)`,
+            ];
+            if (summary.broken.length > 0) {
+              lines.push(
+                "",
+                "Workspace roots that no longer exist — resuming a thread recorded there",
+                "used to silently lose its history (Kimi validates the ORIGINAL directory",
+                "on session/load). The wrapper now recreates the directory and retries",
+                "automatically, so these restore again on next resume:",
+                "",
+              );
+              for (const group of summary.broken) {
+                lines.push(
+                  `  ${group.workDir}  (${group.sessionIds.length} session${group.sessionIds.length === 1 ? "" : "s"})`,
+                );
+              }
+            }
+            return ok(lines.join("\n"));
+          }
           case "unregister": {
             const changed = await unregister();
             return ok(
@@ -718,7 +770,7 @@ export default async function plugin(bb: BbPluginApi) {
           }
           default:
             return fail(
-              `Unknown subcommand "${sub}". Try: status, models, skills, sync, login, doctor, unregister.`,
+              `Unknown subcommand "${sub}". Try: status, models, skills, sessions, sync, login, doctor, unregister.`,
             );
         }
       } catch (error) {
@@ -812,6 +864,56 @@ export default async function plugin(bb: BbPluginApi) {
       shadowed: candidates.filter(
         (candidate) => existence[candidate.path] === true && !activePaths.has(candidate.path),
       ),
+    };
+  }
+
+  /**
+   * Restorability of Kimi's recorded sessions on one machine: which recorded
+   * workspace roots still exist. A missing root is exactly the condition that
+   * used to make `session/load` fail and silently drop a thread's history.
+   * Reads the target host through `bb.sdk.files`/`bb.sdk.hosts`, never
+   * `node:fs`, for the same reason as `readSkills`.
+   */
+  async function readSessionRestorability(hostId: string): Promise<{
+    home: string | null;
+    indexPath: string | null;
+    summary: ReturnType<typeof summarizeRestorability> | null;
+  }> {
+    let home: string | null = null;
+    try {
+      home = (await bb.sdk.hosts.directory({ hostId })).directory;
+    } catch {
+      home = null;
+    }
+    if (home === null || home.length === 0) {
+      return { home: null, indexPath: null, summary: null };
+    }
+    const indexPath = `${home}/.kimi-code/session_index.jsonl`;
+    let raw: string | null = null;
+    try {
+      const file = await bb.sdk.files.read({ hostId, path: indexPath, rootPath: home });
+      raw = file.content;
+    } catch {
+      raw = null;
+    }
+    if (raw === null) return { home, indexPath, summary: null };
+
+    const groups = groupByWorkDir(parseSessionIndex(raw));
+    if (groups.length === 0) {
+      return {
+        home,
+        indexPath,
+        summary: summarizeRestorability([], () => true),
+      };
+    }
+    const { existence } = await bb.sdk.hosts.pathsExist({
+      hostId,
+      paths: groups.map((group) => group.workDir),
+    });
+    return {
+      home,
+      indexPath,
+      summary: summarizeRestorability(groups, (path) => existence[path] === true),
     };
   }
 
@@ -935,8 +1037,18 @@ export default async function plugin(bb: BbPluginApi) {
         try {
           const hosts = await readHostHealth();
           const reachable = hosts.filter((host) => host.status === "connected");
-          if (reachable.length > 0 && reachable.every((host) => !host.available)) {
-            const codes = new Set(reachable.map((host) => host.errorCode));
+          // Transient daemon conditions (timeouts, restarts) are excluded:
+          // only alert when at least one host has a HARD failure and none is
+          // healthy — a fleet that is merely busy resolves itself.
+          const hardFailed = reachable.filter(
+            (host) => !host.available && host.errorCode !== "transient",
+          );
+          if (
+            reachable.length > 0 &&
+            reachable.every((host) => !host.available) &&
+            hardFailed.length > 0
+          ) {
+            const codes = new Set(hardFailed.map((host) => host.errorCode));
             if (codes.has("auth_required")) {
               bb.status.needsConfiguration(
                 "Kimi Code is not signed in. Run `bb kimi login`, then reload this plugin.",

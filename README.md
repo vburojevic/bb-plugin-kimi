@@ -96,7 +96,7 @@ Verified end to end on a live `acp-kimi` thread (event stream inspected via
 | Skills | ✅ loaded by Kimi's own discovery — see caveat below |
 | Model picker | ✅ resolved per machine |
 | Reasoning levels | ✅ low/high/max on models that advertise efforts |
-| Session resume | ✅ Kimi advertises `loadSession`; bb uses `session/load` |
+| Session resume | ✅ Kimi advertises `loadSession`; bb uses `session/load` — plus the wrapper's healing below |
 | Kimi's own MCP servers | ✅ loaded by Kimi from its own config |
 | Interrupt | ✅ bb's bridge issues `session/cancel` |
 | Provider logo | ✅ |
@@ -174,12 +174,35 @@ Plus `extra_skill_dirs` in `~/.kimi-code/config.toml`, and Kimi's built-ins.
 That exclusivity is the usual surprise — creating `~/.kimi/skills` silently
 hides `~/.claude/skills` — so the command reports shadowed roots explicitly.
 
+## Session-load healing (why old threads used to lose their history)
+
+Kimi's `session/load` validates the **workspace root recorded when the session
+was created** — not the cwd bb passes on resume. bb destroys and re-provisions
+worktree environments routinely, so resuming any thread whose original
+directory was cleaned up failed with
+`workspace root <path> does not exist`; bb's ACP bridge swallows that error and
+silently continues in a **fresh session**, i.e. Kimi forgets every previous
+message while the bb timeline still shows them. This was the "old Kimi threads
+don't load previous messages" bug.
+
+Since 0.2.0 the wrapper heals it in-flight: it tracks `session/load` requests,
+and when the agent rejects one with that error it recreates the missing
+directory (confined to `$HOME`), retries the load once, and answers bb's
+original request — so history restores instead of vanishing. Disable with
+`KIMI_SESSION_LOAD_HEAL=0` in the agent environment if you ever need the raw
+behavior.
+
+`bb kimi sessions` reports the same condition ahead of time: which recorded
+workspace roots on a machine still exist, and how many sessions would need
+healing.
+
 ## Commands
 
 ```sh
 bb kimi status                 # registration + per-machine health and models
 bb kimi models [--machine <m>] # models each machine reports
 bb kimi skills [--machine <m>] # skill roots Kimi discovers on a machine
+bb kimi sessions [--machine <m>] # which recorded sessions can still restore their history
 bb kimi sync                   # re-register from current settings
 bb kimi login  [--machine <m>] # open a terminal running the device-code login
 bb kimi doctor                 # raw ACP handshake against the bb server host
