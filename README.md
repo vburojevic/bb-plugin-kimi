@@ -136,7 +136,7 @@ checking that the bridge never emits the corresponding events:
 | Auto thread titles | Bridge never emits `thread/name/updated`; `supportsRename: false` |
 | Archive forwarding, fork | `supportsArchive` / `supportsFork` `false` for ACP |
 | `/plan` and `/goal` composer actions | ACP providers expose `skills` only |
-| Skills in the `/` composer menu | bb's skill provider enum is literally `['claude-code','codex']`, and the ACP launch spec has no `skillRoots` field |
+| Skills in the `/` composer menu beyond bb/plugin entries | bb ≤ 0.38's daemon scan only knew `claude-code`/`codex` roots; bb ≥ 0.39 (branch `feat/acp-skill-typeahead`) scans the ACP roots below, mirroring Kimi's own discovery |
 | "Fast" service tier | The bridge only reads `serviceTier` in the CLI-flag (`selectFlag`) model path; Kimi uses native ACP selection, so the toggle is a silent no-op |
 | bb-managed CLI install / status | `providerCliStatus` covers only `codex`, `claudeCode`, `cursor`. Use `bb kimi status` instead |
 | Install-docs link on a missing CLI | bb's install-docs registry has only `codex` and `acp-cursor`, so the error is generic |
@@ -158,7 +158,7 @@ runs in Kimi's `default` mode. bb then applies its own presets on top:
   hardcodes `accept-edits`/`full`); a stored `auto` preference silently becomes
   **Full Access** when a thread switches to acp-kimi. Mind the promotion.
 
-### Skills work — the `/` menu just cannot show them
+### Skills work — and the `/` menu is catching up
 
 This one is worth stating plainly because the symptom looks like breakage.
 Kimi Code does its **own** skill discovery at session start and injects each
@@ -166,8 +166,11 @@ skill's name, path, and description into its system prompt, so skills load in a
 bb thread exactly as in the terminal. Verified by having a bb Kimi thread quote a
 skill's `SKILL.md` frontmatter and list its sibling files.
 
-What is missing is only bb's `/` composer menu. **Invoke a skill by name**
-("use your shadcn skill") instead of looking for it under `/`.
+On bb ≤ 0.38 the `/` composer menu shows only bb's own and plugin skills for
+Kimi threads — the daemon's scan knew no ACP roots. bb ≥ 0.39 scans the same
+roots Kimi does (below), so the menu and the agent then agree. Until that
+ships: **invoke a skill by name** ("use your shadcn skill") instead of looking
+for it under `/`.
 
 `bb kimi skills [--machine <m>] [--json]` reports the roots a machine actually
 uses. Kimi's documented roots are checked per scope, and within each group only

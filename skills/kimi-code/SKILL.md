@@ -119,18 +119,21 @@ bb's permission presets with acp-kimi:
   hardcodes `accept-edits`/`full`); a stored `auto` preference silently becomes
   **Full Access** when you switch a thread to acp-kimi. Mind the promotion.
 
-## Skills: they work, but not from the `/` menu
+## Skills: they work, and the `/` menu is catching up
 
 **Skills DO load in Kimi threads.** Kimi Code does its own discovery at session
 start and injects every skill's name, path, and description into its system
 prompt. Verified: a bb Kimi thread quoted a skill's `SKILL.md` frontmatter and
 listed its sibling files.
 
-**bb's `/` composer menu will be empty for Kimi threads.** bb attributes every
-skill it knows to `claude-code` or `codex` (its skill provider enum is literally
-those two), and the ACP launch spec carries no `skillRoots` field. This affects
-every ACP provider, not just Kimi. So: **invoke a skill by name in the prompt**
-("use your shadcn skill") rather than looking for it under `/`.
+**bb's `/` composer menu was near-empty for Kimi threads on bb ≤ 0.38.** The
+menu lists bb's own and plugin skills (32 entries) but none of your user or
+project skills, because the host daemon's scan only knew the `claude-code` and
+`codex` roots. bb ≥ 0.39 (branch `feat/acp-skill-typeahead`) teaches it the ACP
+roots — the vendor-neutral `.agents` locations plus each known agent's brand
+roots in its own first-existing-wins order — so the menu then mirrors exactly
+what Kimi loads. Until that ships, invoke a skill by name in the prompt ("use
+your shadcn skill") rather than looking for it under `/`.
 
 `bb kimi skills [--machine <id>] [--json]` shows which roots a machine actually
 uses. Kimi's documented roots, per scope, are checked in this order — and within
