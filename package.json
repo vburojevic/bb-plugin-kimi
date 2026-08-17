@@ -1,9 +1,9 @@
 {
   "name": "bb-plugin-kimi",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Adds Moonshot AI's Kimi Code as a BB provider (acp-kimi) over the Agent Client Protocol.",
   "license": "MIT",
-  "author": "Vedran Burojevi\u0107",
+  "author": "Vedran Burojević",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/vburojevic/bb-plugin-kimi.git"

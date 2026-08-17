@@ -30,6 +30,7 @@ interface FakeHost {
   logs: { level: string; message: string }[];
   sdkCalls: { path: string; input: unknown }[];
   setSettings: (values: Record<string, unknown>) => Promise<void>;
+  dispose: () => void;
   dataDir: string;
 }
 
@@ -68,6 +69,7 @@ function createFakeHost(options: {
   let settingsDefaults: Record<string, unknown> = {};
   const settingsValues: Record<string, unknown> = { ...options.settings };
   const changeListeners: ((next: unknown, prev: unknown) => void)[] = [];
+  const disposeListeners: (() => void)[] = [];
 
   // Deep-path stubs like "hosts.list"; unstubbed calls fail loudly with the
   // path so a test never silently passes on a default.
@@ -135,7 +137,7 @@ function createFakeHost(options: {
     },
     status: { needsConfiguration: (message: string) => logs.push({ level: "needs-config", message }) },
     events: { on() {} },
-    onDispose() {},
+    onDispose: (listener: () => void) => disposeListeners.push(listener),
     sdk: sdkProxy(""),
   };
 
@@ -151,6 +153,9 @@ function createFakeHost(options: {
       Object.assign(settingsValues, values);
       const next = { ...settingsDefaults, ...settingsValues };
       for (const listener of changeListeners) listener(next, previous);
+    },
+    dispose: () => {
+      for (const listener of disposeListeners) listener();
     },
     dataDir,
   };
@@ -213,7 +218,10 @@ describe("sync", () => {
     const entry = kimiEntry(host)!;
     expect(entry.command).toBe("/bin/sh");
     expect(entry.args[1]).toContain("acp-coalesce.mjs");
-    expect(entry.env).toEqual({ KIMI_ACP_REAL: "kimi" });
+    expect(entry.env).toEqual({
+      KIMI_ACP_REAL: "kimi",
+      KIMI_MCP_TOOL_TIMEOUT_MS: "3600000",
+    });
 
     const reloads = () => host.sdkCalls.filter((call) => call.path === "system.reloadConfig");
     expect(reloads()).toHaveLength(1);
@@ -235,6 +243,7 @@ describe("sync", () => {
       displayName: "Kimi Code",
       command: "kimi",
       args: ["acp"],
+      env: { KIMI_MCP_TOOL_TIMEOUT_MS: "3600000" },
     });
   });
 
@@ -246,6 +255,30 @@ describe("sync", () => {
 
     await host.setSettings({ displayName: "Kimi (staging)" });
     await expect.poll(() => kimiEntry(host)?.displayName).toBe("Kimi (staging)");
+  });
+
+  it("ignores a settings change delivered after dispose (stale-handle guard)", async () => {
+    const host = createFakeHost({ settings: { showLogo: false } });
+    await plugin(host.bb);
+    await host.rpcHandlers.sync!(null);
+    expect(kimiEntry(host)!.displayName).toBe("Kimi Code");
+
+    const reloadsBefore = host.sdkCalls.filter(
+      (call) => call.path === "system.reloadConfig",
+    ).length;
+    host.dispose();
+    await host.setSettings({ displayName: "Kimi (disposed)" });
+
+    // The disposed instance must neither reconcile nor throw through its stale
+    // bb handle: no config write, no new reload, no error log. A real host can
+    // deliver a queued change to the old listener after reload replaced it.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const reloadsAfter = host.sdkCalls.filter(
+      (call) => call.path === "system.reloadConfig",
+    ).length;
+    expect(reloadsAfter).toBe(reloadsBefore);
+    expect(kimiEntry(host)!.displayName).toBe("Kimi Code");
+    expect(host.logs.filter((entry) => entry.level === "error")).toHaveLength(0);
   });
 });
 

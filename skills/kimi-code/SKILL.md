@@ -75,24 +75,49 @@ provider that works locally and fails on a remote machine is visible immediately
 Works: streaming text, thinking blocks, tool calls, file edits with diffs, shell
 commands with exit codes, permission prompts, Accept-Edits write confinement,
 image input, multi-turn context, skills, model selection, reasoning levels,
-session resume, MCP servers, and interrupt.
+session resume, MCP servers, interrupt, and **bb plugin agent tools** — bb
+serves them to Kimi over its `bb-bridge` MCP server, so `mcp__*` tools
+(`accounts_quota`, `xcode_status`, `AskUserQuestion`, …) are callable from Kimi
+threads. Interactive tools (AskUserQuestion) only work end-to-end because this
+plugin sets `KIMI_MCP_TOOL_TIMEOUT_MS=3600000` in the provider's launch env:
+Kimi's MCP client otherwise times out every tool call after 60 seconds, far
+short of bb's 10-minute default interaction budget, so questions errored before
+anyone could answer. On bb builds predating the daemon heartbeat fix, answers
+must arrive within ~5 minutes (the daemon's HTTP read aborted the interaction
+then); newer bb keeps the call open for the full budget and unwinds the pending
+interaction promptly when the agent's client abandons the call
+(`notifications/cancelled` propagates instead of being dropped).
 
 Not available — these are bb ACP-bridge limits shared by every ACP provider
 (`acp-cursor`, `acp-opencode`, `acp-hermes-agent`, `acp-kimi`), not Kimi
 limitations. Do not report them as bugs in this plugin or in Kimi:
 
 - Token-usage and context-window meters, plan/todo rendering, auto thread titles,
-  thread fork, archive forwarding, provider user-questions.
+  thread fork, archive forwarding.
 - `/plan` and `/goal` composer commands (only `/` skills exist), and the `/`
   skills menu itself is empty — see below.
-- **bb plugin agent tools** (`accounts_quota`, `xcode_status`, `bb_workflow_run`,
-  `update_environment_directory`) are NOT callable. bb spawns its MCP tool bridge
-  and Kimi supports stdio MCP, but no `mcp__*` tool reaches the agent. Use the
-  equivalent **`bb` CLI command** instead (e.g. `bb accounts list`) — the bb CLI
-  works normally from a Kimi thread. Plugin *skills* and *instructions* DO
-  arrive; only the tools are missing.
 - The **"Fast" service tier** toggle is a silent no-op for Kimi.
 - bb cannot install or status-check the Kimi CLI (`bb kimi status` does that).
+
+## Modes and permission presets
+
+Kimi advertises its own modes over ACP (`default`, `plan`, `auto`, `yolo` as a
+`mode` config option), but bb's ACP bridge only consumes the `model` and
+`thought_level` config categories — the mode option is neither shown nor set,
+so **Kimi's plan/auto/yolo modes are unreachable from bb** and every thread
+runs in Kimi's `default` mode. That is harmless: bb enforces its own presets
+on top.
+
+bb's permission presets with acp-kimi:
+
+- **Accept Edits** — Kimi stays in `default` mode and issues
+  `session/request_permission` for gated actions; bb answers them per the
+  preset and confines writes to the workspace. Works.
+- **Full Access** — same flow, bb auto-allows every request. Works, at the
+  cost of one permission round-trip per tool call.
+- **Approve for me (`auto`)** — not supported for any ACP provider (bb
+  hardcodes `accept-edits`/`full`); a stored `auto` preference silently becomes
+  **Full Access** when you switch a thread to acp-kimi. Mind the promotion.
 
 ## Skills: they work, but not from the `/` menu
 

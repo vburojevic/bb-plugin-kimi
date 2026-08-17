@@ -118,6 +118,7 @@ describe("buildDesiredEntry", () => {
       displayName: "Kimi Code",
       command: "kimi",
       args: ["acp"],
+      env: { KIMI_MCP_TOOL_TIMEOUT_MS: "3600000" },
     });
   });
 
@@ -148,7 +149,10 @@ describe("buildDesiredEntry with coalescing", () => {
     expect(wrapped.args?.[1]).toContain("acp-coalesce.mjs");
     // $0 for the sh script, then the positional args the agent receives.
     expect(wrapped.args?.slice(2)).toEqual(["kimi-acp", "acp"]);
-    expect(wrapped.env).toEqual({ KIMI_ACP_REAL: "kimi" });
+    expect(wrapped.env).toEqual({
+      KIMI_ACP_REAL: "kimi",
+      KIMI_MCP_TOOL_TIMEOUT_MS: "3600000",
+    });
   });
 
   it("threads a custom CLI path through env, not through the snippet", () => {
@@ -161,7 +165,10 @@ describe("buildDesiredEntry with coalescing", () => {
     // The snippet is a CONSTANT — a path with spaces or shell metacharacters
     // can never corrupt it because it only ever travels as data.
     expect(custom.args?.[1]).toBe(wrapped.args?.[1]);
-    expect(custom.env).toEqual({ KIMI_ACP_REAL: "/opt/tools dir/kimi" });
+    expect(custom.env).toEqual({
+      KIMI_ACP_REAL: "/opt/tools dir/kimi",
+      KIMI_MCP_TOOL_TIMEOUT_MS: "3600000",
+    });
   });
 
   it("keeps identity fields identical across plain and wrapped shapes", () => {

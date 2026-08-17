@@ -120,6 +120,10 @@ type HostHealth = z.infer<typeof hostHealthSchema>;
 type Status = z.infer<typeof statusSchema>;
 
 export default async function plugin(bb: BbPluginApi) {
+  // Set in onDispose. Anything that can outlive a reload — detached async, the
+  // settings listener, background work — must check it before touching `bb`,
+  // whose handle is invalid the moment this instance is replaced.
+  let disposed = false;
   const settings = bb.settings.define({
     cliPath: {
       type: "string",
@@ -140,10 +144,11 @@ export default async function plugin(bb: BbPluginApi) {
       type: "boolean",
       label: "Coalesce tool-call progress updates",
       description:
-        "Kimi streams a progress snapshot per output tick and BB persists each one; " +
-        "long sessions can write hundreds of megabytes of events and stall BB. " +
-        "This routes the agent through a small proxy that keeps at most ~2 " +
-        "snapshots per second per tool call, losslessly.",
+        "Kimi streams a progress snapshot per output tick and one reasoning " +
+        "delta per token tick, and BB persists each one; long sessions can " +
+        "write hundreds of megabytes of events and stall BB. This routes the " +
+        "agent through a small proxy that keeps at most ~2 snapshots per " +
+        "second per tool call or thought stream, losslessly.",
       default: true,
     },
     showLogo: {
@@ -1078,13 +1083,24 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   settings.onChange(() => {
+    // A reload disposes this instance but the host may still deliver a change
+    // to the listener the old factory registered. Everything below reaches
+    // through the captured `bb` handle, which is stale by then — that is the
+    // "used a stale API handle" error this used to log. The fresh instance
+    // reads the new settings at load, so there is nothing to do here.
+    if (disposed) return;
     invalidateHealth();
     void reconcile().catch((error: unknown) => {
-      bb.log.error(
-        `re-registration after settings change failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
+      if (disposed) return;
+      try {
+        bb.log.error(
+          `re-registration after settings change failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      } catch {
+        // Stale handle despite the flag — the fresh instance owns this now.
+      }
     });
   });
 
@@ -1092,6 +1108,7 @@ export default async function plugin(bb: BbPluginApi) {
   // every plugin reload, and pulling the provider out from under a running Kimi
   // thread would break it. `bb kimi unregister` is the explicit removal path.
   bb.onDispose(() => {
+    disposed = true;
     bb.log.info("disposed");
   });
 }

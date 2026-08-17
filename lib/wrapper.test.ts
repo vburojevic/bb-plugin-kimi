@@ -63,6 +63,17 @@ function chunk(text: string): string {
   });
 }
 
+function thought(text: string, session = "s1"): string {
+  return JSON.stringify({
+    jsonrpc: "2.0",
+    method: "session/update",
+    params: {
+      sessionId: session,
+      update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text } },
+    },
+  });
+}
+
 const RESPONSE = JSON.stringify({ jsonrpc: "2.0", id: 1, result: { protocolVersion: 1 } });
 const PERMISSION_REQUEST = JSON.stringify({
   jsonrpc: "2.0",
@@ -179,6 +190,16 @@ function toolUpdatesOf(messages: Record<string, any>[]): Record<string, any>[] {
 
 function textOf(update: Record<string, any>): string | undefined {
   return update.params.update.content?.[0]?.content?.text;
+}
+
+function thoughtChunksOf(messages: Record<string, any>[]): Record<string, any>[] {
+  return messages.filter(
+    (message) => message.params?.update?.sessionUpdate === "agent_thought_chunk",
+  );
+}
+
+function thoughtTextOf(update: Record<string, any>): string {
+  return update.params.update.content.text as string;
 }
 
 // --- coalescing behavior -----------------------------------------------------
@@ -314,6 +335,119 @@ describe("coalescing", () => {
       env: { KIMI_COALESCE_MS: "0" },
     });
     expect(toolUpdatesOf(parsed(run))).toHaveLength(20);
+  });
+});
+
+// --- thought-chunk coalescing ------------------------------------------------
+
+describe("thought coalescing", () => {
+  it("collapses a thought burst into leading + concatenated trailing, losslessly", async () => {
+    // Multibyte and JSON-hostile characters ride along to catch escaping bugs.
+    const parts = ["thinking", " → step 2", " héllo", ' "quoted" \\ path', " 終"];
+    const agent = writeEmittingAgent([...parts.map((part) => thought(part)), chunk("done")]);
+    const run = await runWrapper(agent);
+    expect(run.code).toBe(0);
+
+    const messages = parsed(run);
+    const thoughts = thoughtChunksOf(messages);
+    // Leading edge, then ONE merged trailing edge flushed by the message chunk.
+    expect(thoughts).toHaveLength(2);
+    expect(thoughtTextOf(thoughts[0]!)).toBe(parts[0]);
+    expect(thoughtTextOf(thoughts[1]!)).toBe(parts.slice(1).join(""));
+    // Lossless: the delivered text concatenates to exactly the sent text.
+    expect(thoughts.map(thoughtTextOf).join("")).toBe(parts.join(""));
+
+    // The message chunk flushed the held text before itself: order holds.
+    const chunkIndex = messages.findIndex(
+      (message) => message.params?.update?.sessionUpdate === "agent_message_chunk",
+    );
+    expect(chunkIndex).toBe(2);
+    expect(messages).toHaveLength(3);
+  });
+
+  it("does not merge thought runs separated by other traffic", async () => {
+    const run = await runWrapper(
+      writeEmittingAgent([thought("before"), chunk("middle"), thought("after")]),
+    );
+    const messages = parsed(run);
+    const thoughts = thoughtChunksOf(messages);
+    // "before" is the leading edge; "after" arrives within the same window but
+    // behind a message chunk, so it starts a new run rather than merging into
+    // text that BB already closed.
+    expect(thoughts).toHaveLength(2);
+    expect(thoughtTextOf(thoughts[0]!)).toBe("before");
+    expect(thoughtTextOf(thoughts[1]!)).toBe("after");
+    expect(messages.map((m) => m.params?.update?.sessionUpdate)).toEqual([
+      "agent_thought_chunk",
+      "agent_message_chunk",
+      "agent_thought_chunk",
+    ]);
+  });
+
+  it("keeps thought streams independent per session", async () => {
+    const run = await runWrapper(
+      writeEmittingAgent([
+        thought("s1 first", "s1"),
+        thought("s2 first", "s2"),
+        thought("s1 second", "s1"),
+        thought("s2 second", "s2"),
+      ]),
+    );
+    const thoughts = thoughtChunksOf(parsed(run));
+    // Both sessions get a leading edge; their trailing edges merge per session.
+    const bySession = (session: string) =>
+      thoughts.filter((t) => t.params.sessionId === session).map(thoughtTextOf);
+    expect(bySession("s1")).toEqual(["s1 first", "s1 second"]);
+    expect(bySession("s2")).toEqual(["s2 first", "s2 second"]);
+  });
+
+  it("flushes held thought text on the trailing edge when the stream goes quiet", async () => {
+    const agent = writeAgent(`
+      emit(${JSON.stringify(thought("lead"))});
+      for (let i = 1; i <= 5; i++) emit(${JSON.stringify(thought(" more"))});
+      await sleep(${THROTTLE_MS * 4});
+      emit(${JSON.stringify(chunk("late"))});
+    `);
+    const run = await runWrapper(agent);
+    const thoughts = run.lines.filter((line) => line.raw.includes("agent_thought_chunk"));
+    expect(thoughts).toHaveLength(2);
+    expect(JSON.parse(thoughts[1]!.raw).params.update.content.text).toBe(" more".repeat(5));
+    // The merged text arrived via the throttle timer, NOT with the late chunk.
+    const lateChunkAt = run.lines.find((line) => line.raw.includes("late"))!.atMs;
+    expect(thoughts[1]!.atMs).toBeLessThan(lateChunkAt - THROTTLE_MS);
+  });
+
+  it("passes a non-text thought chunk through untouched", async () => {
+    const odd = JSON.stringify({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "s1",
+        update: { sessionUpdate: "agent_thought_chunk", content: { type: "resource" } },
+      },
+    });
+    const run = await runWrapper(
+      writeEmittingAgent([thought("lead"), thought("held"), odd, thought("tail")]),
+    );
+    const raw = run.lines.map((line) => line.raw);
+    // The odd chunk lands verbatim, and the text held when it arrived ("held")
+    // flushed before it — the odd chunk is a run boundary just like BB's.
+    expect(raw).toContain(odd);
+    const thoughts = thoughtChunksOf(parsed(run)).filter(
+      (t) => t.params.update.content.type === "text",
+    );
+    expect(thoughts.map(thoughtTextOf)).toEqual(["lead", "held", "tail"]);
+    expect(raw.indexOf(odd)).toBeGreaterThan(
+      raw.findIndex((line) => line.includes('"held"')),
+    );
+  });
+
+  it("forwards every thought chunk when KIMI_COALESCE_MS is 0", async () => {
+    const lines = Array.from({ length: 20 }, (_, i) => thought(`t${i + 1}`));
+    const run = await runWrapper(writeEmittingAgent(lines), {
+      env: { KIMI_COALESCE_MS: "0" },
+    });
+    expect(thoughtChunksOf(parsed(run))).toHaveLength(20);
   });
 });
 

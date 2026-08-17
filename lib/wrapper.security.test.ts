@@ -3,7 +3,7 @@
 // multi-byte characters split across pipe chunks, lines too large to buffer,
 // prototype-pollution payloads, and floods against a stalled reader.
 
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFile, execFileSync, spawn } from "node:child_process";
@@ -174,6 +174,19 @@ describe("oversized lines", () => {
     // Merged into the terminal snapshot instead, carrying the payload forward.
     expect(lines.at(-1)).toContain('"completed"');
     expect(lines.at(-1)!.length).toBeGreaterThan(capBytes * 4);
+  });
+});
+
+describe("wrapper source hygiene", () => {
+  it("materializes without raw control characters", () => {
+    // WRAPPER_SOURCE is a template literal: an innocent-looking `\0` (or any
+    // raw escape) in a comment becomes a literal control byte in the file
+    // every host downloads — grep then calls it binary and some tooling
+    // chokes. Everything past tab/CR/LF must be printable.
+    const content = readFileSync(wrapper, "utf8");
+    // eslint-disable-next-line no-control-regex
+    const offenders = content.match(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g);
+    expect(offenders).toBeNull();
   });
 });
 

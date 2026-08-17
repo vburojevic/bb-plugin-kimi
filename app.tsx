@@ -39,6 +39,7 @@ interface KimiStatus {
   entry: Record<string, unknown> | null;
   hosts: KimiHost[];
   warning: string | null;
+  coalescing: boolean;
 }
 
 function StatusDot({ tone }: { tone: "ok" | "warn" | "error" }) {
@@ -181,6 +182,12 @@ function KimiSettings() {
         <dt className="text-muted-foreground">Config</dt>
         <dd>
           <code className="text-xs break-all">{status.configPath}</code>
+        </dd>
+        <dt className="text-muted-foreground">Coalescing</dt>
+        <dd className="text-sm">
+          {status.coalescing
+            ? "on — tool-call and reasoning streams are throttled before bb persists them"
+            : "off — bb persists every streamed update (can grow bb.db fast)"}
         </dd>
       </dl>
 

@@ -17,16 +17,25 @@
 // for each terminal-output tick, so one long command execution can write tens
 // of thousands of ~4KB rows — a single day-long thread once grew bb.db past
 // half a gigabyte and pinned the server's main thread in synchronous SQLite
-// scans. The agent cannot be told to stream less, and the bridge is BB core,
-// so the one seam this plugin owns is the spawned process itself: register a
-// wrapper instead of the bare CLI and thin the firehose in transit.
+// scans. Kimi also streams one tiny `agent_thought_chunk` per token-ish tick
+// of reasoning, which is the same firehose on a second channel (measured:
+// ~15k persisted rows in one 30-minute thread). The agent cannot be told to
+// stream less, and the bridge is BB core, so the one seam this plugin owns is
+// the spawned process itself: register a wrapper instead of the bare CLI and
+// thin the firehose in transit.
 //
 // Losslessness: ACP `tool_call_update` fields REPLACE the tool call's previous
 // values (they are partial snapshots, not deltas), so merging a run of updates
 // per (sessionId, toolCallId) — newer fields over older — and emitting the
-// merged snapshot is semantically identical to delivering every tick. Terminal
-// statuses flush immediately, and any non-coalescable message flushes all held
-// state first, so relative ordering BB can observe is preserved.
+// merged snapshot is semantically identical to delivering every tick. Thought
+// chunks are the opposite: their text APPENDS to the session's open reasoning
+// item (BB itself concatenates every delta it receives), so merging a
+// contiguous run of chunks into their concatenation is identical too. Message
+// chunks stay untouched: they are coarse already and the user reads them
+// live. Terminal statuses flush immediately, and any non-coalescable message
+// flushes all held state first, so relative ordering BB can observe — and the
+// reasoning-item boundaries it derives from tool_call/message/turn edges — is
+// preserved.
 //
 // Robustness posture: the agent side of the pipe is treated as untrusted
 // input. Decoding goes through a StringDecoder so multi-byte UTF-8 split
@@ -68,11 +77,16 @@ export const LAUNCH_SNIPPET =
   'exec "${KIMI_ACP_REAL:-kimi}" "$@"';
 
 export const WRAPPER_SOURCE = `#!/usr/bin/env node
-// ACP stdio proxy for bb-plugin-kimi. Two jobs:
+// ACP stdio proxy for bb-plugin-kimi. Three jobs:
 //  1. Coalesce tool_call_update notifications so BB persists snapshots at most
 //     every KIMI_COALESCE_MS (default 500ms) per tool call, instead of one
 //     event per output tick.
-//  2. Heal session/load failures caused by a missing workspace root (BB
+//  2. Coalesce agent_thought_chunk notifications the same way per session —
+//     Kimi streams one tiny reasoning delta per token-ish tick and BB persists
+//     each one, which is the same event-store firehose on a second channel.
+//     Deltas append, so merging concatenates their text (lossless); message
+//     chunks stay untouched.
+//  3. Heal session/load failures caused by a missing workspace root (BB
 //     destroys worktree environments; Kimi validates the session's original
 //     directory) by recreating the directory and retrying the load once —
 //     without this, resumed threads silently lose their entire history.
@@ -280,7 +294,21 @@ function writeOut(data) {
   }
 }
 
-// key = sessionId + toolCallId → the latest merged, not-yet-forwarded message.
+// key → the latest merged, not-yet-forwarded message, tagged by stream kind.
+// Two streams share this map, and Map insertion order (first-held order) is
+// what lets flushAll emit held state in arrival order across both:
+//
+//  - tool_call_update snapshots (key prefix "tool", then sessionId and
+//    toolCallId): ACP update fields REPLACE the tool call's previous values,
+//    so merging is a field union with the newest value winning per field.
+//  - agent_thought_chunk deltas (key prefix "thought", then sessionId): chunk
+//    text APPENDS to the session's open reasoning item (BB itself
+//    concatenates every delta it receives into that item), so merging a
+//    contiguous run of chunks into their concatenation is identical. The
+//    boundaries BB uses to close a reasoning item — a new tool_call, a
+//    message chunk, turn end — are all non-coalescable, so they flush held
+//    thought text before themselves and the run boundary lands exactly where
+//    BB would put it.
 const pending = new Map();
 const timers = new Map();
 const lastEmit = new Map();
@@ -309,8 +337,8 @@ function pruneBookmarks(now) {
 const TERMINAL_STATUS = new Set(["completed", "failed", "cancelled"]);
 
 function emit(key) {
-  const message = pending.get(key);
-  if (message === undefined) return;
+  const entry = pending.get(key);
+  if (entry === undefined) return;
   pending.delete(key);
   const timer = timers.get(key);
   if (timer !== undefined) {
@@ -323,22 +351,44 @@ function emit(key) {
   lastEmit.delete(key);
   lastEmit.set(key, now);
   pruneBookmarks(now);
-  writeOut(JSON.stringify(message) + "\\n");
+  writeOut(JSON.stringify(entry.message) + "\\n");
 }
 
 function flushAll() {
   for (const key of [...pending.keys()]) emit(key);
 }
 
-/** Non-null only for agent-notification tool_call_update messages. */
-function coalescableKey(message) {
+/** Non-null only for coalescable agent session/update notifications. */
+function coalescableTarget(message) {
   if (message === null || typeof message !== "object" || Array.isArray(message)) return null;
   if (message.method !== "session/update" || "id" in message) return null;
   const update = message.params?.update;
   if (update === null || typeof update !== "object") return null;
-  if (update.sessionUpdate !== "tool_call_update") return null;
-  if (typeof update.toolCallId !== "string") return null;
-  return String(message.params.sessionId) + "\\u0000" + update.toolCallId;
+  if (update.sessionUpdate === "tool_call_update" && typeof update.toolCallId === "string") {
+    return {
+      kind: "tool",
+      key:
+        "tool\\u0000" +
+        String(message.params.sessionId) +
+        "\\u0000" +
+        update.toolCallId,
+    };
+  }
+  if (update.sessionUpdate === "agent_thought_chunk") {
+    const content = update.content;
+    if (
+      content === null ||
+      typeof content !== "object" ||
+      content.type !== "text" ||
+      typeof content.text !== "string"
+    ) {
+      // A thought chunk that is not plain text is not mergeable; it passes
+      // through like any other update (and flushes held state first).
+      return null;
+    }
+    return { kind: "thought", key: "thought\\u0000" + String(message.params.sessionId) };
+  }
+  return null;
 }
 
 function handleLine(line) {
@@ -350,21 +400,27 @@ function handleLine(line) {
     message = null;
   }
   if (interceptAgentResponse(message, line)) return;
-  const key = message === null ? null : coalescableKey(message);
-  if (key === null) {
+  const target = message === null ? null : coalescableTarget(message);
+  if (target === null) {
     // Anything else — responses, requests, other session updates, unparsable
     // lines — flushes held state first so observable ordering is preserved.
     flushAll();
     writeOut(line + "\\n");
     return;
   }
-
+  const key = target.key;
   const held = pending.get(key);
   if (held !== undefined) {
+    if (target.kind === "thought") {
+      // Only the text grows; the held envelope already carries sessionUpdate
+      // and content.type, identical across the run.
+      held.message.params.update.content.text += message.params.update.content.text;
+      return;
+    }
     // ACP update fields replace prior values, so field-level merge is
     // lossless. Spread copies own properties with define semantics, so a
     // hostile "__proto__" key stays inert data.
-    held.params.update = { ...held.params.update, ...message.params.update };
+    held.message.params.update = { ...held.message.params.update, ...message.params.update };
     if (TERMINAL_STATUS.has(message.params.update.status)) {
       emit(key);
       // A terminal status ends the tool call; dropping its throttle bookmark
@@ -373,14 +429,14 @@ function handleLine(line) {
     }
     return;
   }
-  if (TERMINAL_STATUS.has(message.params.update.status)) {
-    pending.set(key, message);
+  if (target.kind === "tool" && TERMINAL_STATUS.has(message.params.update.status)) {
+    pending.set(key, { kind: target.kind, message });
     emit(key);
     lastEmit.delete(key);
     return;
   }
   const sinceLast = Date.now() - (lastEmit.get(key) ?? 0);
-  pending.set(key, message);
+  pending.set(key, { kind: target.kind, message });
   if (sinceLast >= THROTTLE_MS) {
     emit(key);
     return;

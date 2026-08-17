@@ -40,12 +40,22 @@ The entry it writes is deliberately minimal:
   "displayName": "Kimi Code",
   "command": "kimi",
   "args": ["acp"],
+  "env": { "KIMI_MCP_TOOL_TIMEOUT_MS": "3600000" },
   "logo": "<dataDir>/plugins/kimi/kimi-code.svg"
 }
 ```
 
 (With progress coalescing on — the default — `command`/`args` instead point at a
 small proxy. See [Tool-call progress coalescing](#tool-call-progress-coalescing).)
+
+The env matters: bb serves plugin agent tools to Kimi over its MCP bridge, and
+interactive tools (AskUserQuestion) legitimately pend on a human for most of an
+hour — bb's own interaction budget caps at 60 minutes. Kimi's MCP client
+otherwise times out every tool call after **60 seconds**, so any agent question
+errored long before anyone could answer. `KIMI_MCP_TOOL_TIMEOUT_MS` raises that
+to 60 minutes, scoped to the bb-spawned process — a terminal `kimi` keeps its
+own defaults. Verified with a probe MCP server: the failure moves exactly from
+60s to the configured value.
 
 No `modelCli`, `reasoningCli`, `nativeReasoning`, or `permissionCli` — because
 bb's ACP bridge already handles all four natively for Kimi:
@@ -85,21 +95,32 @@ Verified end to end on a live `acp-kimi` thread (event stream inspected via
 | Feature | Status |
 | --- | --- |
 | Streaming assistant text | ✅ `item/agentMessage/delta` |
-| Thinking / reasoning blocks | ✅ `item/reasoning` |
+| Thinking / reasoning blocks | ✅ `item/reasoning` (coalesced by the wrapper — below) |
 | Tool calls + live progress | ✅ `item/toolCall` + `progress` |
 | File edits with unified diffs | ✅ `item/fileChange` carries the diff |
 | Shell commands, output, exit code | ✅ `item/commandExecution` |
-| Permission prompts | ✅ bb answers `session/request_permission` per thread mode |
-| Accept-Edits write confinement | ✅ bb enforces workspace write roots |
+| Accept-Edits write confinement | ✅ writes via Kimi's fs tool outside the workspace are denied cleanly |
+| Full Access auto-allow | ✅ verified live: writes land without prompts |
 | Image input | ✅ Kimi advertises `promptCapabilities.image`; verified on a real image |
 | Multi-turn context | ✅ |
 | Skills | ✅ loaded by Kimi's own discovery — see caveat below |
 | Model picker | ✅ resolved per machine |
 | Reasoning levels | ✅ low/high/max on models that advertise efforts |
-| Session resume | ✅ Kimi advertises `loadSession`; bb uses `session/load` — plus the wrapper's healing below |
+| Session resume | ✅ Kimi advertises `loadSession`; bb uses `session/load` — plus the wrapper's healing below. Verified: full stop + reload, history intact |
 | Kimi's own MCP servers | ✅ loaded by Kimi from its own config |
+| **bb plugin agent tools** (`mcp__bb-bridge__*`) | ✅ served over bb's MCP bridge; AskUserQuestion round-trip verified live |
 | Interrupt | ✅ bb's bridge issues `session/cancel` |
 | Provider logo | ✅ |
+
+Two permission-prompt caveats, both Kimi-side rather than bb-side:
+
+- Under **Accept Edits**, shell commands are **not gated**: Kimi's ACP server in
+  its `default` mode issues `session/request_permission` for the actions it
+  considers gated, and bb can only answer what Kimi sends. In practice that
+  covers fs-tool writes (confined, as above) but not shell commands — those run
+  without prompting. Use Full Access deliberately.
+- Interactive plugin tools (AskUserQuestion) only survive the wait because this
+  plugin sets `KIMI_MCP_TOOL_TIMEOUT_MS=3600000` in the launch env — see below.
 
 ### Not available — and not fixable from a plugin
 
@@ -110,45 +131,32 @@ checking that the bridge never emits the corresponding events:
 
 | Missing | Why |
 | --- | --- |
-| Token usage + context-window meter | Bridge never emits `thread/tokenUsage/updated` or `thread/contextWindowUsage/updated` |
+| Token usage meter | Bridge never emits `thread/tokenUsage/updated` (context-window usage **is** emitted as of bb 0.38) |
 | Plan / todo list | Bridge never emits `turn/plan/updated` |
 | Auto thread titles | Bridge never emits `thread/name/updated`; `supportsRename: false` |
-| Archive forwarding, fork, user questions | `supportsArchive` / `supportsFork` / `supportsUserQuestion` all `false` for ACP |
+| Archive forwarding, fork | `supportsArchive` / `supportsFork` `false` for ACP |
 | `/plan` and `/goal` composer actions | ACP providers expose `skills` only |
 | Skills in the `/` composer menu | bb's skill provider enum is literally `['claude-code','codex']`, and the ACP launch spec has no `skillRoots` field |
-| bb plugin agent tools (`accounts_quota`, `xcode_status`, …) | bb spawns its `bb-acp-bridge.mjs --mcp-stdio` tool bridge, but no `mcp__*` tool reaches the agent — see below |
 | "Fast" service tier | The bridge only reads `serviceTier` in the CLI-flag (`selectFlag`) model path; Kimi uses native ACP selection, so the toggle is a silent no-op |
 | bb-managed CLI install / status | `providerCliStatus` covers only `codex`, `claudeCode`, `cursor`. Use `bb kimi status` instead |
 | Install-docs link on a missing CLI | bb's install-docs registry has only `codex` and `acp-cursor`, so the error is generic |
 | Settings → Providers page | That nav list is a hardcoded `[codex, claude-code]` constant in bb's frontend |
 
-Kimi's own ACP `mode` option (`default`/`plan`/`auto`/`yolo`) is likewise not
-driven by bb — bb owns permissions through its own modes instead.
+### Modes and permission presets
 
-#### bb plugin agent tools do not reach ACP threads
+Kimi advertises its own modes over ACP (`default` / `plan` / `auto` / `yolo` as
+a `mode` config option), but bb's ACP bridge only consumes the `model` and
+`thought_level` config categories — the mode option is neither shown nor set,
+so **Kimi's plan/auto/yolo modes are unreachable from bb** and every thread
+runs in Kimi's `default` mode. bb then applies its own presets on top:
 
-Worth recording because every layer looks correct in isolation:
-
-- bb **does** build the tool list (`resolveDynamicTools` always includes at least
-  `update_environment_directory`), passes it through the ACP launch spec, and
-  **does** spawn the bridge — `bb-acp-bridge.mjs --mcp-stdio` is observable in
-  the process list during a Kimi turn.
-- Kimi **does** support stdio MCP over ACP. Verified with a purpose-built MCP
-  server: Kimi called `mcp__probe-mcp__zzprobe_marker` and returned its result.
-- Kimi **does** forward the ACP `env` array to stdio MCP servers, which is how
-  bb's bridge is configured. Verified: the probe server read back
-  `BB_PROBE_ENV=FORWARDED_OK`.
-- Yet in a bb thread Kimi has **no** `mcp__*` tool, and asked to call
-  `accounts_quota` it tries several invocation paths, fails, and falls back to
-  the `bb accounts` CLI.
-- Control test on a second ACP provider: a Hermes thread in bb lists its **own**
-  MCP tools (`mcp__craft__*`, from Hermes's config) but none of bb's bridge
-  tools either. So ACP agents surface MCP tools fine in general — bb's bridge
-  specifically never delivers its tools, across ACP providers.
-
-So the bridge is started but never serves its tools to the agent. Nothing in a
-plugin can change that. Plugin **skills** and plugin **instructions** are
-unaffected — both reach Kimi normally.
+- **Accept Edits** — Kimi issues permission requests for gated actions; bb
+  answers per preset and confines fs-tool writes to the workspace. Works.
+- **Full Access** — same flow, bb auto-allows every request. Works, at the cost
+  of one permission round-trip per gated tool call.
+- **Approve for me (`auto`)** — unsupported for every ACP provider (bb
+  hardcodes `accept-edits`/`full`); a stored `auto` preference silently becomes
+  **Full Access** when a thread switches to acp-kimi. Mind the promotion.
 
 ### Skills work — the `/` menu just cannot show them
 
@@ -230,6 +238,9 @@ store. Kimi streams a `tool_call_update` snapshot for each terminal-output tick,
 so one long-running command can write tens of thousands of ~4KB rows. In the
 session that motivated this, two threads grew `bb.db` to 576MB and pinned the bb
 server's main thread in synchronous SQLite scans — the whole app stuttered.
+Kimi's reasoning stream is the same firehose on a second channel: one tiny
+`agent_thought_chunk` per token-ish tick, ~15k persisted rows in a single
+30-minute thread.
 
 The agent cannot be told to stream less, and the bridge is bb core, so the one
 seam a plugin owns is the spawned process. With `coalesceProgress` on, the
@@ -252,16 +263,22 @@ sweep, so late-joining hosts are covered.
 **It is lossless.** ACP `tool_call_update` fields *replace* prior values rather
 than appending, so merging a run of updates per `(sessionId, toolCallId)` —
 newest field wins — and emitting the merged snapshot is semantically identical
-to delivering every tick. Terminal statuses flush immediately, and any
-non-coalescable message flushes held state first, so ordering bb can observe is
-preserved. A representative 60-chunk command now writes **17 events / 3KB** with
-zero progress rows.
+to delivering every tick. Thought chunks are the opposite: their text *appends*
+to the session's open reasoning item (bb concatenates every delta itself), so
+concatenating a contiguous run per session is identical too — and every message
+type bb uses to close a reasoning item (new tool call, message chunk, turn end)
+is non-coalescable, so run boundaries land exactly where bb would put them.
+Terminal statuses flush immediately, and any non-coalescable message flushes
+held state first, so ordering bb can observe is preserved. A representative
+60-chunk command now writes **17 events / 3KB** with zero progress rows, and a
+thinking-heavy turn writes one reasoning event per throttle window instead of
+one per token tick.
 
 Tuning, mostly for debugging:
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `KIMI_COALESCE_MS` | `500` | Max snapshot rate per tool call. `0` disables coalescing. |
+| `KIMI_COALESCE_MS` | `500` | Max snapshot rate per tool call / thought stream. `0` disables coalescing. |
 | `KIMI_MAX_LINE_BYTES` | `33554432` | Lines above this stream through verbatim instead of being buffered. |
 
 Turn the whole thing off with `bb plugin config kimi set coalesceProgress false`.

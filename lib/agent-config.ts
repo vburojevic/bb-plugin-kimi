@@ -139,6 +139,17 @@ export interface DesiredEntryArgs {
 }
 
 /**
+ * Budget for one MCP tool call Kimi makes, in milliseconds. BB serves
+ * interactive plugin tools (AskUserQuestion and friends) through its MCP
+ * bridge, and those legitimately pend on a human for most of an hour — BB's
+ * own interaction budget caps at 60 minutes. Kimi's MCP client otherwise
+ * times out every tool call after 60 seconds, so any agent question errored
+ * long before the user could possibly answer. Scoped to the BB-spawned
+ * process via env, so a terminal `kimi` keeps its own defaults.
+ */
+const MCP_TOOL_TIMEOUT_MS = "3600000";
+
+/**
  * The canonical acp-kimi entry.
  *
  * Deliberately omits `modelCli`, `reasoningCli`, `nativeReasoning`, and
@@ -165,8 +176,13 @@ export function buildDesiredEntry(args: DesiredEntryArgs): CustomAcpAgentEntry {
       ...identity,
       command: "/bin/sh",
       args: ["-c", LAUNCH_SNIPPET, "kimi-acp", "acp"],
-      env: { KIMI_ACP_REAL: args.command },
+      env: { KIMI_ACP_REAL: args.command, KIMI_MCP_TOOL_TIMEOUT_MS: MCP_TOOL_TIMEOUT_MS },
     };
   }
-  return { ...identity, command: args.command, args: ["acp"] };
+  return {
+    ...identity,
+    command: args.command,
+    args: ["acp"],
+    env: { KIMI_MCP_TOOL_TIMEOUT_MS: MCP_TOOL_TIMEOUT_MS },
+  };
 }
